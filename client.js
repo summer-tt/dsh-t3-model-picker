@@ -73,6 +73,9 @@ window.__ModuleLoader__.load({
       'effort.title': 'Reasoning effort',
       'effort.providerDefault': 'Default',
       'effort.back': 'Back to models',
+      'team.label': 'Enable agent teamwork',
+      'team.confirmDisable': 'Disable agent teamwork? Shared task tools and team coordination instructions will no longer be used in this conversation.',
+      'team.failed': 'Could not save agent teamwork: {message}',
       'warning.groupLoad': '{name} failed to load: {message}',
       'group.models': '{count} models',
       'shortcut.aria': 'Shortcut {label}',
@@ -100,6 +103,9 @@ window.__ModuleLoader__.load({
       'effort.title': '推理等级',
       'effort.providerDefault': '默认',
       'effort.back': '返回模型列表',
+      'team.label': '启用智能体团队协作',
+      'team.confirmDisable': '确认停用智能体团队协作？停用后，本会话将停止使用共享任务工具和团队协调指令。',
+      'team.failed': '无法保存智能体团队协作设置：{message}',
       'warning.groupLoad': '{name} 加载失败：{message}',
       'group.models': '{count} 个模型',
       'shortcut.aria': '快捷键 {label}',
@@ -477,11 +483,18 @@ window.__ModuleLoader__.load({
      * @returns the seated control.
      */
     function ModelPicker({
-      locked, available, directory, load, select, favorites, routable, t,
+      locked, available, directory, load, select, favorites, routable, teamRemote,
+      sessionId, useProjection, useSession, useSessions, t,
     }) {
       const state = useSnapshot(directory)
       const catalog = useSnapshot(routable)
       const favoriteList = useSnapshot(favorites)
+      const setTeamEnabled = useSnapshot(teamRemote)
+      const teamMode = useProjection('agentTeam')
+      const modelSelection = useProjection('modelSelection')
+      const addressedChild = useSession(snapshot => snapshot.subagent !== null)
+      const listedChild = useSessions(snapshot => snapshot.byId[sessionId]?.origin === 'subagent')
+      const [teamPending, setTeamPending] = useState(false)
 
       const [open, setOpen] = useState(false)
       const [pane, setPane] = useState('favorites')
@@ -666,6 +679,29 @@ window.__ModuleLoader__.load({
         else show()
       }, [close, open, show])
 
+      const reportFailure = useCallback((text) => {
+        setToast({ seq: ++toastSeq.current, text })
+      }, [])
+
+      const teamLocked = locked || busy || teamPending || modelSelection === undefined
+      const selectTeam = async (enabled) => {
+        if (teamLocked || setTeamEnabled === undefined) return
+        if (!enabled && modelSelection.lastUsed !== null) {
+          ReactDOM.flushSync(() => close())
+          triggerRef.current?.focus()
+          if (!window.confirm(t('team.confirmDisable'))) return
+        }
+        setTeamPending(true)
+        try {
+          const result = await setTeamEnabled(sessionId, enabled)
+          if (!result.ok) reportFailure(t('team.failed', { message: result.error.message }))
+        } catch (error) {
+          reportFailure(t('team.failed', { message: error instanceof Error ? error.message : String(error) }))
+        } finally {
+          setTeamPending(false)
+        }
+      }
+
       const submit = useCallback((selection) => {
         lastActionRef.current = 'select'
         triggerRef.current?.focus()
@@ -675,15 +711,11 @@ window.__ModuleLoader__.load({
             close(true)
             return
           }
-          toastSeq.current += 1
-          setToast({
-            seq: toastSeq.current,
-            text: result.error.code === 'session/writer-held'
-              ? t('error.sessionInUse')
-              : t('error.action', { message: `${result.error.code}: ${result.error.message}` }),
-          })
+          reportFailure(result.error.code === 'session/writer-held'
+            ? t('error.sessionInUse')
+            : t('error.action', { message: `${result.error.code}: ${result.error.message}` }))
         })
-      }, [close, select, t])
+      }, [close, reportFailure, select, t])
 
       const chooseModel = useCallback((row) => {
         if (current !== null && current.provider === row.provider && current.model === row.model.id) {
@@ -1105,6 +1137,16 @@ window.__ModuleLoader__.load({
           h('div', { className: 't3mp-list scrollable' }, resultNodes),
           empty ? h('div', { className: 't3mp-empty' }, t('empty.models')) : null,
           effortRow,
+          open && !effortPane && !addressedChild && !listedChild && teamMode !== undefined && setTeamEnabled !== undefined
+            ? h('label', { className: 't3mp-team-row' },
+              t('team.label'),
+              h('input', {
+                className: 't3mp-team-switch', type: 'checkbox', role: 'switch',
+                checked: teamMode.enabled, disabled: teamLocked,
+                onChange: (event) => { void selectTeam(event.target.checked) },
+              }),
+            )
+            : null,
         ),
       )
 
@@ -1290,6 +1332,13 @@ window.__ModuleLoader__.load({
 .t3mp-effort-label { flex: 0 0 auto; color: var(--dsw-alias-label-caption); }
 .t3mp-effort-value { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-primary); }
 .t3mp-effort-chevron { flex: 0 0 auto; color: var(--dsw-alias-label-caption); }
+.t3mp-team-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  flex: 0 0 auto; padding: 8px 12px; border-top: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-primary); font-size: 12px; cursor: pointer;
+}
+.t3mp-team-row:has(:disabled) { opacity: 0.5; cursor: default; }
+.t3mp-team-switch { margin: 0; flex: 0 0 auto; accent-color: var(--dsw-alias-brand-primary); cursor: inherit; }
 
 .t3mp-pane-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; flex: 0 0 auto; }
 .t3mp-back {
@@ -1345,6 +1394,27 @@ window.__ModuleLoader__.load({
       const favorites = createFavoritesStore()
       const routable = createRoutableStore(ctx.remote)
 
+      // Keep the picker available on profiles that omit the Team remote.
+      const teamListeners = new Set()
+      let teamSelection
+      const publishTeamSelection = (select) => {
+        teamSelection = select
+        for (const listener of teamListeners) listener()
+      }
+      const teamRemote = {
+        getSnapshot: () => teamSelection,
+        subscribe(listener) {
+          teamListeners.add(listener)
+          return () => { teamListeners.delete(listener) }
+        },
+      }
+      ctx.inject(['remote', 'remote.agentTeams'], (scope) => {
+        scope.effect(() => {
+          publishTeamSelection((sessionId, enabled) => scope.remote.agentTeams.setEnabled(sessionId, enabled))
+          return () => { publishTeamSelection(undefined) }
+        })
+      })
+
       const refresh = () => { void routable.load() }
       ctx.on('connection/reset', refresh)
       ctx.remote.$on('llm/adapters-updated', refresh)
@@ -1389,6 +1459,7 @@ window.__ModuleLoader__.load({
               : Promise.resolve(undefined),
             favorites,
             routable,
+            teamRemote,
           }
         },
       }, ModelPicker))

@@ -118,11 +118,26 @@ async function boot({ platform }) {
   const disposers = []
   const catalog = { ok: true, value: { routableProviders: ['deepseek', 'openai'] } }
   let seat = null
+  let teamError
+  const team = createStore({ enabled: false })
+  const teamCalls = []
   const ctx = {
     effect(fn) { disposers.push(fn()) },
     on() {},
+    inject(_keys, setup) { setup(ctx) },
     locale: { register(_ns, dicts) { dictionary = dicts.en } },
-    remote: { $on() {}, session: { modelCatalog: () => Promise.resolve(catalog) } },
+    remote: {
+      $on() {},
+      session: { modelCatalog: () => Promise.resolve(catalog) },
+      agentTeams: {
+        async setEnabled(sessionId, enabled) {
+          teamCalls.push({ sessionId, enabled })
+          if (teamError !== undefined) return { ok: false, error: { message: teamError } }
+          team.setSnapshot({ enabled })
+          return { ok: true }
+        },
+      },
+    },
     slots: {
       inject(_name, loadSeat) { return loadSeat() },
       register(options, component) {
@@ -166,7 +181,16 @@ async function boot({ platform }) {
         null,
         ...Array.from({ length: count }, (_, index) => h(
           seat.component,
-          { ...seat.props, t, key: `seat-${index}`, ...overrides },
+          {
+            ...seat.props, t, key: `seat-${index}`, sessionId: 'session-1',
+            useSession: selector => selector({ subagent: null }),
+            useSessions: selector => selector({ byId: {} }),
+            useProjection: name => {
+              const mode = React.useSyncExternalStore(team.subscribe, team.getSnapshot)
+              return name === 'agentTeam' ? mode : { lastUsed: CURRENT }
+            },
+            ...overrides,
+          },
         )),
       ))
     })
@@ -182,7 +206,8 @@ async function boot({ platform }) {
   const click = async (node) => { await act(async () => { node.click() }) }
 
   return {
-    window, act, render, press, click, t,
+    window, act, render, press, click, t, team, teamCalls,
+    failTeam: (message) => { teamError = message },
     panels: () => window.document.querySelectorAll('.t3mp-panel').length,
     triggers: () => window.document.querySelectorAll('.t3mp-trigger'),
     expanded: () => window.document.querySelectorAll('.t3mp-trigger[aria-expanded="true"]').length,
@@ -226,6 +251,14 @@ async function main() {
   check('the chord is consumed, not passed on to the host', opened.defaultPrevented)
   check('the search field takes focus on open', mac.search() !== null
     && mac.window.document.activeElement === mac.search())
+  await mac.act(() => {
+    const input = mac.search()
+    const setValue = Object.getOwnPropertyDescriptor(mac.window.HTMLInputElement.prototype, 'value').set
+    setValue.call(input, 'seek chat')
+    input.dispatchEvent(new mac.window.Event('input', { bubbles: true }))
+  })
+  const results = [...mac.window.document.querySelectorAll('.t3mp-row-name')].map(row => row.textContent)
+  check('multi-word search still filters models', results.length === 1 && results[0] === 'DeepSeek Chat')
 
   // The same chord typed into the composer editor, not into the card.
   const editor = mac.window.document.createElement('textarea')
@@ -294,6 +327,47 @@ async function main() {
 
   await mac.render(1)
   check('the trigger tooltip advertises ⌘⇧M on macOS', mac.triggers()[0].title.endsWith('⌘⇧M'), mac.triggers()[0].title)
+
+  await renderSelection({ provider: 'deepseek', model: 'deepseek-chat' })
+  await mac.render(1, { directory })
+  await mac.press(MAC)
+  const teamSwitch = () => mac.window.document.querySelector('.t3mp-team-switch')
+  check('a model without effort still offers Team in a root session', teamSwitch()?.checked === false
+    && mac.window.document.querySelector('.t3mp-effort-row') === null)
+  await mac.click(teamSwitch())
+  check('enabling targets the current session', mac.teamCalls[0]?.sessionId === 'session-1'
+    && mac.teamCalls[0]?.enabled === true)
+  check('the switch shows the saved Team projection', teamSwitch()?.checked === true)
+  await mac.press(MAC)
+  await mac.press(MAC)
+  check('reopening the menu shows Team already enabled', teamSwitch()?.checked === true)
+
+  let confirmationCount = 0
+  let menuDismissed = false
+  mac.window.confirm = () => {
+    confirmationCount += 1
+    menuDismissed = mac.panels() === 0 && mac.window.document.activeElement === mac.triggers()[0]
+    return false
+  }
+  await mac.click(teamSwitch())
+  check('confirming starts after the menu closes and focus returns to the trigger', menuDismissed)
+  check('cancelling disable leaves Team enabled', confirmationCount === 1
+    && mac.teamCalls.length === 1 && mac.team.getSnapshot().enabled)
+
+  await mac.press(MAC)
+  mac.window.confirm = () => { confirmationCount += 1; return true }
+  await mac.click(teamSwitch())
+  check('confirming disable saves the change for the same session', confirmationCount === 2
+    && mac.teamCalls[1]?.sessionId === 'session-1' && mac.teamCalls[1]?.enabled === false
+    && !mac.team.getSnapshot().enabled)
+
+  await mac.press(MAC)
+  mac.failTeam('Team write refused')
+  await mac.click(teamSwitch())
+  check('failed writes report the error without changing the saved mode', teamSwitch()?.checked === false
+    && mac.window.document.querySelector('.t3mp-toast')?.textContent.includes('Team write refused'))
+  await mac.render(1, { directory, useSessions: selector => selector({ byId: { 'session-1': { origin: 'subagent' } } }) })
+  check('listed subagents do not expose the Team switch', teamSwitch() === null)
 
   await mac.unmount()
   await mac.press(MAC)

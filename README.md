@@ -45,6 +45,10 @@ Harness's model directory. Please support the original project.
   model name when the model advertises effort levels. The picker footer opens
   those levels. In the composer's compact layout, the button retains the
   effort and its tooltip shows both the model and effort.
+- **Agent teamwork.** The picker footer shows a root session's saved Team
+  setting when the host exposes Agent Teams. The switch is available regardless
+  of the model's effort levels. Disabling Team after a model request asks for
+  confirmation.
 
 ## Install
 
