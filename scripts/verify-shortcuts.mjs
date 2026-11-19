@@ -80,6 +80,10 @@ const GROUPS = [
     ],
   },
   { id: 'openai', name: 'OpenAI', models: [{ id: 'gpt-5', name: 'GPT-5' }] },
+  { id: 'deepseek-account', name: 'DeepSeek Account', models: [{ id: 'account-model', name: 'Account model' }] },
+  { id: 'magpie', name: 'Magpie', models: [{ id: 'gateway-model', name: 'Gateway model' }] },
+  { id: 'openai-codex', name: 'Codex Subscription', models: [{ id: 'codex-model', name: 'Codex model' }] },
+  { id: 'custom', name: 'Custom Provider', models: [{ id: 'custom-model', name: 'Custom model' }] },
 ]
 
 const CURRENT = { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'medium' }
@@ -254,11 +258,33 @@ async function main() {
   check('the visible effort falls back to the model default', triggerEffort()?.textContent === 'Medium')
   await renderSelection({ provider: 'deepseek', model: 'deepseek-chat' })
   check('the trigger omits effort for a model without a reasoning ladder', triggerEffort() === null)
+  for (const [provider, model, logo] of [
+    ['magpie', 'gateway-model', 'magpie'],
+    ['openai-codex', 'codex-model', 'codex'],
+    ['deepseek-account', 'account-model', 'deepseek'],
+    ['custom', 'custom-model', 'generic'],
+  ]) {
+    await renderSelection({ provider, model })
+    check(`the composer shows the ${logo} icon for ${provider}`, mac.triggers()[0].querySelector(
+      `svg.t3mp-trigger-glyph[data-t3mp-logo="${logo}"] > path`,
+    ) !== null)
+  }
   await mac.render(1)
 
   const opened = await mac.press(MAC)
   check('Cmd+Shift+M opens the card', mac.panels() === 1, `panels=${mac.panels()}`)
   check('the chord is consumed, not passed on to the host', opened.defaultPrevented)
+  for (const [provider, logo] of [
+    ['deepseek-account', 'deepseek'], ['magpie', 'magpie'],
+    ['openai-codex', 'codex'], ['custom', 'generic'],
+  ]) {
+    const tile = mac.window.document.querySelector(`[data-t3mp-rail="${provider}"]`)
+    check(`the rail shows the ${logo} icon for ${provider}`, tile?.getAttribute('aria-label')
+      && tile.querySelector(`svg[data-t3mp-logo="${logo}"] > path`) && tile.textContent === '')
+  }
+  const rowProvider = mac.window.document.querySelector('.t3mp-row-footer')
+  check('model rows show only the provider name', rowProvider?.textContent === 'DeepSeek'
+    && rowProvider.children.length === 1 && rowProvider.firstElementChild.matches('.t3mp-row-provider'))
   check('the search field takes focus on open', mac.search() !== null
     && mac.window.document.activeElement === mac.search())
   await mac.act(() => {
@@ -269,6 +295,9 @@ async function main() {
   })
   const results = [...mac.window.document.querySelectorAll('.t3mp-row-name')].map(row => row.textContent)
   check('multi-word search still filters models', results.length === 1 && results[0] === 'DeepSeek Chat')
+  const section = mac.window.document.querySelector('.t3mp-section-head')
+  check('search group headings show the provider name without an icon', section?.textContent === 'DeepSeek'
+    && section.querySelector('svg') === null)
 
   // The same chord typed into the composer editor, not into the card.
   const editor = mac.window.document.createElement('textarea')

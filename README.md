@@ -22,7 +22,9 @@ Harness's model directory. Please support the original project.
 ## Features
 
 - **Provider rail.** A 44px column with `Favorites` first and one tile per
-  advertised provider. The active entry carries a primary-colored indicator.
+  advertised provider. The rail and composer show provider logos where available.
+  Model rows show the provider name. The active rail entry carries a
+  primary-colored indicator.
 - **Search.** The field takes focus when the picker opens. Matching uses tiered
   scoring over the model name, its description, the provider id and the
   provider name, including subsequence matching for queries of three characters
@@ -55,7 +57,7 @@ Harness's model directory. Please support the original project.
 Install the fork's packaged release into the Web profile:
 
 ```sh
-dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.2-team.2/dsh-t3-model-picker.tgz
+dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.3-logos.1/dsh-t3-model-picker.tgz
 ```
 
 This release uses the same package name as upstream and replaces its copy in
