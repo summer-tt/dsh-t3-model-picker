@@ -55,7 +55,7 @@ Harness's model directory. Please support the original project.
 Install the fork's packaged release into the Web profile:
 
 ```sh
-dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.1-effort.2/dsh-t3-model-picker.tgz
+dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.2-team.1/dsh-t3-model-picker.tgz
 ```
 
 This release uses the same package name as upstream and replaces its copy in
