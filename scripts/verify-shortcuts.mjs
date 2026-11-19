@@ -201,6 +201,19 @@ async function main() {
   await mac.render(1)
 
   check('the card starts closed', mac.panels() === 0)
+  const triggerEffort = () => mac.triggers()[0].querySelector('.t3mp-trigger-effort')
+  check('the closed trigger displays the current effort', triggerEffort()?.textContent === 'Medium')
+
+  const renderSelection = (current) => mac.render(1, {
+    directory: createStore({ status: 'ready', groups: GROUPS, current, failures: [] }),
+  })
+  await renderSelection({ ...CURRENT, reasoningEffort: 'high' })
+  check('the visible effort updates with the session selection', triggerEffort()?.textContent === 'High')
+  await renderSelection({ provider: CURRENT.provider, model: CURRENT.model })
+  check('the visible effort falls back to the model default', triggerEffort()?.textContent === 'Medium')
+  await renderSelection({ provider: 'deepseek', model: 'deepseek-chat' })
+  check('the trigger omits effort for a model without a reasoning ladder', triggerEffort() === null)
+  await mac.render(1)
 
   const opened = await mac.press(MAC)
   check('Cmd+Shift+M opens the card', mac.panels() === 1, `panels=${mac.panels()}`)

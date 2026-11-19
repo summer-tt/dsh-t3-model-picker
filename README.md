@@ -41,32 +41,21 @@ Harness's model directory. Please support the original project.
   trigger is. The shift leaves the bare `Cmd`+`M` text binding alone.
 - **Unavailable models.** Providers the host does not report as routable are
   marked on their rows, on the rail tile's tooltip, and on the trigger.
-- **Reasoning effort.** A footer row opens the effort levels the current model
-  advertises. It is hidden when the model exposes none.
+- **Reasoning effort.** The composer button shows the current effort beside the
+  model name when the model advertises effort levels. The picker footer opens
+  those levels. In the composer's compact layout, the button tooltip still
+  shows the model and effort.
 
 ## Install
 
-From this repository:
+Install the fork's packaged release into the Web profile:
 
 ```sh
-dsh plugin --profile web add github:yusufameri/dsh-t3-model-picker
+dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.1-effort.1/dsh-t3-model-picker.tgz
 ```
 
-Or from the release tarball, which needs no build step:
-
-```sh
-dsh plugin --profile web add https://github.com/yusufameri/dsh-t3-model-picker/releases/latest/download/dsh-t3-model-picker.tgz
-```
-
-Once the package is on npm, the registry form is one word shorter:
-
-```sh
-dsh plugin --profile web add dsh-t3-model-picker
-```
-
-Any of them reconciles the profile's bundle list, so the next boot merges the
-plugin's patch and loads its client half. Removing the bundle restores the
-shipped model selector with no residue.
+This release uses the same package name as upstream and replaces its copy in
+that profile. Removing the bundle restores the shipped model selector.
 
 ## Screenshots
 

@@ -1131,6 +1131,9 @@ window.__ModuleLoader__.load({
             ? h(ProviderGlyph, { providerId: current.provider, name: currentRow?.providerName ?? current.provider, className: 't3mp-trigger-glyph' })
             : h(ChevronDownIcon, { className: 't3mp-trigger-fallback' }),
           h('span', { className: 't3mp-trigger-label' }, modelLabel),
+          effortLabel === undefined
+            ? null
+            : h('span', { className: 't3mp-trigger-effort' }, effortLabel),
           triggerUnavailable
             ? h('span', { className: 't3mp-badge' }, t('badge.unavailable'))
             : null,
@@ -1159,6 +1162,11 @@ window.__ModuleLoader__.load({
 .t3mp-trigger-label {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   display: var(--dsh-composer-model-text-display, block);
+}
+.t3mp-trigger-effort {
+  flex: 0 0 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: var(--dsh-composer-model-text-display, block);
+  color: var(--dsw-alias-label-caption);
 }
 .t3mp-trigger-glyph, .t3mp-trigger-fallback { flex: 0 0 auto; }
 .t3mp-chevron { flex: 0 0 auto; color: var(--dsw-alias-label-caption); transition: transform 120ms ease; }

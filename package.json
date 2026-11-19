@@ -1,6 +1,6 @@
 {
   "name": "dsh-t3-model-picker",
-  "version": "1.1.0",
+  "version": "1.1.1-effort.1",
   "description": "T3 Code's model picker for DeepSeek Harness: a provider rail, provider-grouped search, favorites, a Cmd/Ctrl+Shift+M toggle and Cmd/Ctrl+1..9 shortcuts in the composer.",
   "type": "module",
   "license": "MIT",
