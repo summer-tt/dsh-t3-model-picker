@@ -47,15 +47,15 @@ Harness's model directory. Please support the original project.
   effort and its tooltip shows both the model and effort.
 - **Agent teamwork.** The picker footer shows a root session's saved Team
   setting when the host exposes Agent Teams. The switch is available regardless
-  of the model's effort levels. Disabling Team after a model request asks for
-  confirmation.
+  of the model's effort levels. Disabling Team after a model request opens
+  a confirmation using the host's in-app warning dialog.
 
 ## Install
 
 Install the fork's packaged release into the Web profile:
 
 ```sh
-dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.2-team.1/dsh-t3-model-picker.tgz
+dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.2-team.2/dsh-t3-model-picker.tgz
 ```
 
 This release uses the same package name as upstream and replaces its copy in

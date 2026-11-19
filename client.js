@@ -33,6 +33,7 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const ReactDOM = require('react-dom')
+    const { Button, Modal } = require('@deepseek-ai/dsh-client-ui-primitives')
 
     const h = React.createElement
     const {
@@ -74,7 +75,12 @@ window.__ModuleLoader__.load({
       'effort.providerDefault': 'Default',
       'effort.back': 'Back to models',
       'team.label': 'Enable agent teamwork',
-      'team.confirmDisable': 'Disable agent teamwork? Shared task tools and team coordination instructions will no longer be used in this conversation.',
+      'team.disableTitle': 'Disable agent teamwork?',
+      'team.disableDescription': 'Disabling agent teamwork during a conversation stops the use of shared task tools and team coordination instructions.',
+      'team.disableWarning': 'Disabling it may affect cache reuse, increase subsequent token usage and costs, and affect collaboration on the current task.',
+      'team.disableConfirm': 'Disable',
+      'team.disableCancel': 'Cancel',
+      'team.disableClose': 'Close',
       'team.failed': 'Could not save agent teamwork: {message}',
       'warning.groupLoad': '{name} failed to load: {message}',
       'group.models': '{count} models',
@@ -104,7 +110,12 @@ window.__ModuleLoader__.load({
       'effort.providerDefault': '默认',
       'effort.back': '返回模型列表',
       'team.label': '启用智能体团队协作',
-      'team.confirmDisable': '确认停用智能体团队协作？停用后，本会话将停止使用共享任务工具和团队协调指令。',
+      'team.disableTitle': '确认停用智能体团队协作？',
+      'team.disableDescription': '对话过程中停用智能体团队协作，将停止共享任务工具和团队协调指令。',
+      'team.disableWarning': '停用后可能影响缓存复用、增加后续 token 用量与开销，并影响当前任务的协作效果。',
+      'team.disableConfirm': '确认停用',
+      'team.disableCancel': '取消',
+      'team.disableClose': '关闭',
       'team.failed': '无法保存智能体团队协作设置：{message}',
       'warning.groupLoad': '{name} 加载失败：{message}',
       'group.models': '{count} 个模型',
@@ -495,6 +506,7 @@ window.__ModuleLoader__.load({
       const addressedChild = useSession(snapshot => snapshot.subagent !== null)
       const listedChild = useSessions(snapshot => snapshot.byId[sessionId]?.origin === 'subagent')
       const [teamPending, setTeamPending] = useState(false)
+      const [disableRequest, setDisableRequest] = useState(null)
 
       const [open, setOpen] = useState(false)
       const [pane, setPane] = useState('favorites')
@@ -684,22 +696,43 @@ window.__ModuleLoader__.load({
       }, [])
 
       const teamLocked = locked || busy || teamPending || modelSelection === undefined
-      const selectTeam = async (enabled) => {
-        if (teamLocked || setTeamEnabled === undefined) return
-        if (!enabled && modelSelection.lastUsed !== null) {
-          ReactDOM.flushSync(() => close())
-          triggerRef.current?.focus()
-          if (!window.confirm(t('team.confirmDisable'))) return
-        }
+      const confirmDisable = disableRequest?.sessionId === sessionId
+      const saveTeam = async (enabled, onFailure) => {
+        if (teamLocked || setTeamEnabled === undefined) return false
         setTeamPending(true)
         try {
           const result = await setTeamEnabled(sessionId, enabled)
-          if (!result.ok) reportFailure(t('team.failed', { message: result.error.message }))
+          if (result.ok) return true
+          onFailure(t('team.failed', { message: result.error.message }))
         } catch (error) {
-          reportFailure(t('team.failed', { message: error instanceof Error ? error.message : String(error) }))
+          onFailure(t('team.failed', { message: error instanceof Error ? error.message : String(error) }))
         } finally {
           setTeamPending(false)
         }
+        return false
+      }
+
+      const selectTeam = (enabled) => {
+        if (teamLocked) return
+        if (!enabled && modelSelection.lastUsed !== null) {
+          close()
+          triggerRef.current?.focus()
+          setDisableRequest({ sessionId, error: null })
+          return
+        }
+        void saveTeam(enabled, reportFailure)
+      }
+
+      const confirmTeamDisable = async () => {
+        const request = disableRequest
+        const saved = await saveTeam(false, (error) => {
+          setDisableRequest(current => current === request ? { ...request, error } : current)
+        })
+        if (saved) setDisableRequest(current => current === request ? null : current)
+      }
+
+      const cancelTeamDisable = () => {
+        if (!teamPending) setDisableRequest(null)
       }
 
       const submit = useCallback((selection) => {
@@ -1150,7 +1183,7 @@ window.__ModuleLoader__.load({
         ),
       )
 
-      return h('div', {
+      return h(React.Fragment, null, h('div', {
         ref: rootRef,
         className: 't3mp-root',
         onBlur: onPanelBlur,
@@ -1183,7 +1216,25 @@ window.__ModuleLoader__.load({
         ),
         open ? ReactDOM.createPortal(panel, document.body) : null,
         toast === null ? null : h('div', { key: toast.seq, className: 't3mp-toast', role: 'status' }, toast.text),
-      )
+      ), confirmDisable ? h(Modal, {
+        open: true,
+        tone: 'warning',
+        title: t('team.disableTitle'),
+        closeLabel: t('team.disableClose'),
+        onClose: cancelTeamDisable,
+        className: 't3mp-disable-dialog',
+        contentClassName: 't3mp-disable-content',
+        footer: h(React.Fragment, null,
+          h(Button, { variant: 'outline', disabled: teamPending, 'data-modal-autofocus': true, onClick: cancelTeamDisable }, t('team.disableCancel')),
+          h(Button, { variant: 'primary', disabled: teamLocked, onClick: () => { void confirmTeamDisable() } }, t('team.disableConfirm')),
+        ),
+      },
+        h('div', { className: 't3mp-disable-copy' },
+          h('p', null, t('team.disableDescription')),
+          h('p', null, t('team.disableWarning')),
+        ),
+        disableRequest.error === null ? null : h('p', { role: 'alert', className: 't3mp-disable-error' }, disableRequest.error),
+      ) : null)
     }
 
     // ----------------------------------------------------------------- styles
@@ -1340,6 +1391,13 @@ window.__ModuleLoader__.load({
 .t3mp-team-row:has(:disabled) { opacity: 0.5; cursor: default; }
 .t3mp-team-switch { margin: 0; flex: 0 0 auto; accent-color: var(--dsw-alias-brand-primary); cursor: inherit; }
 
+.t3mp-disable-dialog { width: min(440px, 100%); max-height: 100%; }
+.t3mp-disable-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.t3mp-disable-copy { min-width: 0; overflow-wrap: anywhere; color: var(--dsw-alias-label-secondary); font-size: 14px; line-height: 22px; }
+.t3mp-disable-copy p { margin: 0; }
+.t3mp-disable-copy p + p { margin-top: 12px; }
+.t3mp-disable-error { color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
+
 .t3mp-pane-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; flex: 0 0 auto; }
 .t3mp-back {
   display: inline-flex; align-items: center; gap: 4px; border: none; background: transparent;
@@ -1427,7 +1485,7 @@ window.__ModuleLoader__.load({
       // runs.
       ctx.effect(() => {
         const onKeyDown = (event) => {
-          if (!isToggleChord(event)) return
+          if (!isToggleChord(event) || document.querySelector('.t3mp-disable-dialog') !== null) return
           const target = toggleTarget()
           if (target === null) return
           event.preventDefault()

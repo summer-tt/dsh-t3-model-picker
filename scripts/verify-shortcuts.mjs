@@ -163,7 +163,17 @@ async function boot({ platform }) {
 
   const definition = loaded.find(entry => entry.id === 'dsh-t3-model-picker')
   if (definition === undefined) throw new Error('client.js did not register its module')
-  definition.factory(name => require(name)).apply(ctx)
+  // Render the plugin's dialog content through a stub of the host primitives.
+  const primitives = {
+    Button: ({ variant, ...props }) => h('button', { type: 'button', ...props }),
+    Modal: ({ open, title, tone, className, onClose, closeLabel, footer, children }) => open
+      ? require('react-dom').createPortal(h('section', {
+        role: 'dialog', 'aria-modal': true, 'aria-label': title, className, 'data-tone': tone,
+        'data-invoker': window.document.activeElement?.className,
+      }, h('button', { onClick: onClose }, closeLabel), children, footer), window.document.body)
+      : null,
+  }
+  definition.factory(name => name === '@deepseek-ai/dsh-client-ui-primitives' ? primitives : require(name)).apply(ctx)
 
   const t = (key, params) => String(dictionary[key] ?? key).replace(
     /\{(\w+)\}/gu,
@@ -342,23 +352,30 @@ async function main() {
   await mac.press(MAC)
   check('reopening the menu shows Team already enabled', teamSwitch()?.checked === true)
 
-  let confirmationCount = 0
-  let menuDismissed = false
-  mac.window.confirm = () => {
-    confirmationCount += 1
-    menuDismissed = mac.panels() === 0 && mac.window.document.activeElement === mac.triggers()[0]
-    return false
-  }
+  mac.window.confirm = () => { throw new Error('Browser confirmation must not be used') }
+  const dialog = () => mac.window.document.querySelector('.t3mp-disable-dialog')
+  const action = (label) => [...dialog().querySelectorAll('button')].find(button => button.textContent === label)
   await mac.click(teamSwitch())
-  check('confirming starts after the menu closes and focus returns to the trigger', menuDismissed)
-  check('cancelling disable leaves Team enabled', confirmationCount === 1
+  check('disabling opens the application warning dialog after closing the picker', mac.panels() === 0
+    && dialog()?.dataset.tone === 'warning' && dialog()?.dataset.invoker === 't3mp-trigger')
+  check('the dialog asks the host to focus Cancel first', action('Cancel')?.hasAttribute('data-modal-autofocus'))
+  await mac.press(MAC)
+  check('the model shortcut does not reopen the picker over the confirmation', mac.panels() === 0 && dialog() !== null)
+  await mac.click(action('Cancel'))
+  check('cancelling leaves Team enabled', dialog() === null
     && mac.teamCalls.length === 1 && mac.team.getSnapshot().enabled)
 
   await mac.press(MAC)
-  mac.window.confirm = () => { confirmationCount += 1; return true }
   await mac.click(teamSwitch())
-  check('confirming disable saves the change for the same session', confirmationCount === 2
-    && mac.teamCalls[1]?.sessionId === 'session-1' && mac.teamCalls[1]?.enabled === false
+  mac.failTeam('Team write refused')
+  await mac.click(action('Disable'))
+  check('a failed confirmation stays open with an error and can be retried', mac.team.getSnapshot().enabled
+    && dialog()?.querySelector('[role="alert"]')?.textContent.includes('Team write refused')
+    && action('Disable')?.disabled === false)
+  mac.failTeam(undefined)
+  await mac.click(action('Disable'))
+  check('confirming disable saves the change for the same session and closes the dialog', dialog() === null
+    && mac.teamCalls[2]?.sessionId === 'session-1' && mac.teamCalls[2]?.enabled === false
     && !mac.team.getSnapshot().enabled)
 
   await mac.press(MAC)
