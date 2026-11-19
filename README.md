@@ -43,15 +43,15 @@ Harness's model directory. Please support the original project.
   marked on their rows, on the rail tile's tooltip, and on the trigger.
 - **Reasoning effort.** The composer button shows the current effort beside the
   model name when the model advertises effort levels. The picker footer opens
-  those levels. In the composer's compact layout, the button tooltip still
-  shows the model and effort.
+  those levels. In the composer's compact layout, the button retains the
+  effort and its tooltip shows both the model and effort.
 
 ## Install
 
 Install the fork's packaged release into the Web profile:
 
 ```sh
-dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.1-effort.1/dsh-t3-model-picker.tgz
+dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.1-effort.2/dsh-t3-model-picker.tgz
 ```
 
 This release uses the same package name as upstream and replaces its copy in

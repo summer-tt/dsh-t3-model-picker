@@ -1164,9 +1164,8 @@ window.__ModuleLoader__.load({
   display: var(--dsh-composer-model-text-display, block);
 }
 .t3mp-trigger-effort {
-  flex: 0 0 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  display: var(--dsh-composer-model-text-display, block);
-  color: var(--dsw-alias-label-caption);
+  flex: 0 1 auto; min-width: 0; max-width: 45%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
 }
 .t3mp-trigger-glyph, .t3mp-trigger-fallback { flex: 0 0 auto; }
 .t3mp-chevron { flex: 0 0 auto; color: var(--dsw-alias-label-caption); transition: transform 120ms ease; }

@@ -51,6 +51,10 @@ function createStore(snapshot, extra = {}) {
   return {
     getSnapshot: () => snapshot,
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
+    setSnapshot(next) {
+      snapshot = next
+      for (const listener of listeners) listener()
+    },
     ...extra,
   }
 }
@@ -204,8 +208,10 @@ async function main() {
   const triggerEffort = () => mac.triggers()[0].querySelector('.t3mp-trigger-effort')
   check('the closed trigger displays the current effort', triggerEffort()?.textContent === 'Medium')
 
-  const renderSelection = (current) => mac.render(1, {
-    directory: createStore({ status: 'ready', groups: GROUPS, current, failures: [] }),
+  const directory = createStore({ status: 'ready', groups: GROUPS, current: CURRENT, failures: [] })
+  await mac.render(1, { directory })
+  const renderSelection = (current) => mac.act(() => {
+    directory.setSnapshot({ ...directory.getSnapshot(), current })
   })
   await renderSelection({ ...CURRENT, reasoningEffort: 'high' })
   check('the visible effort updates with the session selection', triggerEffort()?.textContent === 'High')
