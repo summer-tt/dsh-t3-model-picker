@@ -45,7 +45,8 @@ Harness's model directory. Please support the original project.
   marked on their rows, on the rail tile's tooltip, and on the trigger.
 - **Reasoning effort.** The composer button shows the current effort beside the
   model name when the model advertises effort levels. A discrete slider in the picker footer selects the effort supported by the current model. In compact layout the button retains the effort and its tooltip shows both the model and effort.
-- **Session speed and context window.** A compatible Magpie Connect host adds two sliders for configured base models. Speed requests Standard, Fast or Ultrafast. The context slider sets the local token budget. Each slider appears when its corresponding host control is enabled. Select a base model such as `codex/gpt-6.2-sol` to use them. Existing group routes keep their own model IDs.
+- **Session speed and context window.** A compatible Magpie Connect host adds two sliders for configured base models. Speed requests Standard, Fast or Ultrafast. The context slider sets the local token budget. Each slider and its composer-button indicator appears when its corresponding host control is enabled. An outline bolt means Fast, a solid bolt means Ultrafast, and Standard has no bolt. Select a base model such as `codex/gpt-6.2-sol` to use them. Existing group routes keep their own model IDs.
+- **Save on close.** Edits stay in the menu until it is dismissed. Escape discards them. A compatible Host saves the edited controls together, and the composer waits for confirmation before sending. A failed save restores the last confirmed settings, keeps the message draft, and uses the native DSH notification.
 - **Agent teamwork.** The picker footer shows a root session's saved Team
   setting when the host exposes Agent Teams. The switch is available regardless
   of the model's effort levels. Disabling Team after a model request opens

@@ -33,7 +33,7 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const ReactDOM = require('react-dom')
-    const { Button, Modal } = require('@deepseek-ai/dsh-client-ui-primitives')
+    const { Button, IconWarningOutlineRegular, Modal, Toast } = require('@deepseek-ai/dsh-client-ui-primitives')
 
     const h = React.createElement
     const {
@@ -82,7 +82,11 @@ window.__ModuleLoader__.load({
       'contextWindow.tokens': '{count} tokens',
       'status.controlsLoading': 'Loading session controls…',
       'error.controlsLoad': 'Could not load session controls: {message}',
-      'error.controlsSave': 'Could not save {field}: {message}',
+      'error.controlsSave': 'Could not save session controls: {message}',
+      'error.controlsSendBlocked': 'Open the model picker to restore or discard unsaved settings before sending. {message}',
+      'action.restoreControls': 'Restore unsaved changes',
+      'action.discardControls': 'Discard unsaved changes',
+      'trigger.control': '{label} {value}',
       'error.controlsInvalid': 'Invalid session controls response',
       'error.controlsTimeout': 'Request timed out',
       'team.label': 'Enable agent teamwork',
@@ -128,7 +132,11 @@ window.__ModuleLoader__.load({
       'contextWindow.tokens': '{count} tokens',
       'status.controlsLoading': '正在加载会话控件…',
       'error.controlsLoad': '会话控件加载失败：{message}',
-      'error.controlsSave': '{field}保存失败：{message}',
+      'error.controlsSave': '会话设置保存失败：{message}',
+      'error.controlsSendBlocked': '请打开模型菜单，恢复或放弃未保存的设置后再发送。{message}',
+      'action.restoreControls': '恢复未保存的更改',
+      'action.discardControls': '放弃未保存的更改',
+      'trigger.control': '{label} {value}',
       'error.controlsInvalid': '会话控件返回的数据无效',
       'error.controlsTimeout': '请求超时',
       'team.label': '启用智能体团队协作',
@@ -413,6 +421,10 @@ window.__ModuleLoader__.load({
       return value !== null && typeof value === 'object' && !Array.isArray(value)
     }
 
+    function validEffort(value) {
+      return typeof value === 'string' && value.length > 0 && value.trim() === value
+    }
+
     function validOptions(options, validate) {
       return Array.isArray(options) && options.every(validate) && new Set(options).size === options.length
     }
@@ -423,16 +435,22 @@ window.__ModuleLoader__.load({
 
     function validControls(value) {
       return record(value)
+        && (value.batch === undefined || (value.batch === true && typeof value.revision === 'string'
+          && (value.reasoningEffort === null || validEffort(value.reasoningEffort))))
         && (value.speed === undefined || validControl(value.speed, speed => SPEEDS.has(speed)))
         && (value.contextWindow === undefined || validControl(value.contextWindow, tokens => Number.isSafeInteger(tokens) && tokens > 0))
-        && (value.efforts === undefined || validOptions(value.efforts, effort => typeof effort === 'string' && effort.trim() === effort && effort.length > 0))
+        && (value.efforts === undefined || validOptions(value.efforts, validEffort))
+    }
+
+    function controlValue(controls, field) {
+      return field === 'reasoningEffort' ? controls?.reasoningEffort : controls?.[field]?.value
     }
 
     async function requestSessionControls(address, signal, change) {
       // Use the current Host's mount and owner cookie, like Magpie's settings page.
       const url = new URL('api/magpie-session-controls', document.baseURI)
       if (change === undefined) url.search = new URLSearchParams(address).toString()
-      const timeout = AbortSignal.timeout(10_000)
+      const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)])
       const response = await fetch(url, {
         method: change === undefined ? 'GET' : 'POST',
         headers: { accept: 'application/json', ...change === undefined ? {} : { 'content-type': 'application/json' } },
@@ -441,16 +459,24 @@ window.__ModuleLoader__.load({
         credentials: 'same-origin',
         redirect: 'error',
         cache: 'no-store',
-        signal: signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
+        signal: requestSignal,
       })
-      const payload = await response.json().catch(() => undefined)
+      const payload = await response.json().catch(() => {
+        requestSignal.throwIfAborted()
+        return undefined
+      })
       const hostError = payload?.ok === false && typeof payload.error === 'string'
-      // A Host that predates the endpoint falls back to the native model directory.
-      if (change === undefined && !hostError && (response.status === 404 || response.status === 405)) return {}
+      // Hosts without the endpoint use the native model directory.
+      if (change === undefined && !hostError && (response.status === 404 || response.status === 405)) return null
       if (!response.ok || payload?.ok === false) {
-        throw new Error(typeof payload?.error === 'string' && payload.error.length > 0 ? payload.error : `HTTP ${response.status}`)
+        const error = new Error(hostError && payload.error.length > 0 ? payload.error : `HTTP ${response.status}`)
+        error.rejected = hostError && response.status >= 400 && response.status < 500
+        throw error
       }
-      if (payload?.ok !== true || !validControls(payload.value) || (change !== undefined && payload.value[change.field]?.value !== change.value)) {
+      const values = change?.changes ?? (change === undefined ? {} : { [change.field]: change.value })
+      if (payload?.ok !== true || !validControls(payload.value)
+        || (change?.changes !== undefined && payload.value.batch !== true)
+        || Object.entries(values).some(([field, value]) => controlValue(payload.value, field) !== value)) {
         throw new Error('invalid-session-controls')
       }
       return payload.value
@@ -463,189 +489,297 @@ window.__ModuleLoader__.load({
       return error?.message ?? String(error)
     }
 
-    function useSessionControls({ address, revision, open, locked, select, controlOperations }) {
-      const { writes, failures } = controlOperations
-      const [retry, setRetry] = useState(0)
-      const [result, setResult] = useState(null)
-      const [, redraw] = useState(0)
-      const [pending, setPending] = useState(() => new Map())
-      const active = useRef(null)
-      const addressKey = address === null ? null : JSON.stringify(address)
-      const scope = useMemo(() => open && address !== null ? { address, addressKey } : null, [address, addressKey, open, retry, revision])
-
-      const updatePending = (key, operation) => setPending(previous => {
-        const next = new Map(previous)
-        if (operation === null) next.delete(key)
-        else next.set(key, operation)
-        return next
-      })
-
-      useLayoutEffect(() => {
-        active.current = scope
-        return () => { active.current = null }
-      }, [scope])
-
-      useEffect(() => {
-        if (scope === null) return
-        const controller = new AbortController()
-        const load = async () => {
-          // A quick close/reopen can race a write that the Host has already started.
-          await writes.get(scope.addressKey)
-          if (controller.signal.aborted) return
-          try {
-            const controls = await requestSessionControls(scope.address, controller.signal)
-            if (active.current === scope) setResult({ scope, controls })
-          } catch (error) {
-            if (active.current === scope) setResult({ scope, error })
-          }
-        }
-        void load()
-        return () => { controller.abort() }
-      }, [scope, writes])
-
-      const save = (field, value) => {
-        if (locked || scope === null || active.current !== scope || writes.has(scope.addressKey)) return
-        const change = { field, value }
-        failures.delete(scope.addressKey)
-        updatePending(scope.addressKey, { scope, change })
-        const operation = Promise.resolve().then(async () => {
-          if (active.current !== scope) return
-          try {
-            if (field === 'effort') {
-              const outcome = await select({
-                provider: scope.address.provider,
-                model: scope.address.model,
-                ...value === undefined ? {} : { reasoningEffort: value },
-              })
-              if (outcome?.ok !== true) throw outcome?.error ?? new Error('Model selection unavailable')
-            } else {
-              const controls = await requestSessionControls(scope.address, undefined, change)
-              if (active.current === scope) setResult({ scope, controls })
-            }
-          } catch (error) {
-            failures.set(scope.addressKey, { field, error })
-            if (active.current !== scope) return
-            updatePending(scope.addressKey, { scope })
-            if (field !== 'effort') {
-              // A request can fail after committing, or the Host can change capabilities.
-              const controls = await requestSessionControls(scope.address).catch(() => undefined)
-              if (controls !== undefined && active.current === scope) setResult({ scope, controls })
-            }
-          }
-        }).finally(() => {
-          writes.delete(scope.addressKey)
-          updatePending(scope.addressKey, null)
-        })
-        writes.set(scope.addressKey, operation)
+    function createNoticeStore() {
+      let notice = null
+      let seq = 0
+      const listeners = new Set()
+      const publish = (value) => {
+        notice = value
+        for (const listener of listeners) listener()
       }
-
-      const currentResult = result?.scope === scope ? result : null
-      const currentPending = pending.get(addressKey)
       return {
-        controls: currentResult?.controls,
-        loadError: currentResult?.error,
-        saveError: failures.get(addressKey) ?? null,
-        dismissError: () => {
-          if (failures.delete(addressKey)) redraw(count => count + 1)
+        getSnapshot: () => notice,
+        subscribe(listener) {
+          listeners.add(listener)
+          return () => { listeners.delete(listener) }
         },
-        retry: () => {
-          failures.delete(addressKey)
-          setRetry(count => count + 1)
-        },
-        loading: scope !== null && currentResult === null,
-        pending: currentPending !== undefined,
-        change: currentPending?.scope === scope ? currentPending.change : undefined,
-        save,
+        report: (key, error) => publish({ seq: ++seq, key, error }),
+        dismiss: (current) => { if (notice === current) publish(null) },
       }
     }
 
-    function DiscreteSlider({ field, label, options, value, disabled, saving, commit }) {
-      const [preview, setPreview] = useState(null)
-      const previewRef = useRef(null)
-      const pointer = useRef(null)
-      const keys = useRef(new Set())
-      const canceled = useRef(false)
+    function PickerNotice({ notices, renderFactorySlot, t }) {
+      const notice = useSnapshot(notices)
+      if (notice === null) return null
+      const text = t(notice.key, { message: controlErrorMessage(notice.error, t) })
+      const onDone = () => notices.dismiss(notice)
+      return renderFactorySlot?.('workspace.toast.content', { seq: notice.seq, text, tone: 'warning', onDone })
+        ?? h(Toast, { key: notice.seq, text, icon: h(IconWarningOutlineRegular), onDone })
+    }
+
+    function createControlOperations(report) {
+      let controller = new AbortController()
+      let sessions = new WeakMap()
+      let generation = 0
+      const active = new Set()
+      const listeners = new Set()
+      let version = 0
+      const publish = () => {
+        version += 1
+        for (const listener of listeners) listener()
+      }
+
+      const route = (binding, address) => {
+        if (binding == null || address === null) return null
+        let session = sessions.get(binding)
+        if (session === undefined) {
+          session = { routes: new Map(), queue: [], signal: controller.signal }
+          sessions.set(binding, session)
+        }
+        const key = JSON.stringify([address.provider, address.model])
+        let entry = session.routes.get(key)
+        if (entry === undefined) {
+          entry = { address, session, failed: {}, pending: [] }
+          session.routes.set(key, entry)
+        }
+        return entry
+      }
+
+      // A refresh that started before a save cannot publish over that save's receipt.
+      const load = (entry) => {
+        if (entry.session.signal.aborted) return
+        if (entry.reading || entry.pending.length > 0 || entry.unknown) {
+          entry.refreshRequested = true
+          return
+        }
+        entry.refreshRequested = false
+        const tag = {}
+        entry.reading = tag
+        void requestSessionControls(entry.address, entry.session.signal).then((confirmed) => {
+          if (entry.session.signal.aborted || entry.reading !== tag || entry.refreshRequested) return
+          entry.confirmed = confirmed
+          entry.loadError = undefined
+        }, (error) => {
+          if (entry.session.signal.aborted || entry.reading !== tag) return
+          entry.loadError = error
+        }).finally(() => {
+          if (entry.session.signal.aborted || entry.reading !== tag) return
+          entry.reading = undefined
+          publish()
+          if (entry.refreshRequested) load(entry)
+        })
+      }
+
+      // An uncertain write must be followed by a complete read under the same connection.
+      const verify = (entry) => {
+        if (!entry.unknown) return
+        if (entry.verifying) return entry.verifying
+        const { signal } = entry.session
+        entry.verifying = requestSessionControls(entry.address, signal).then((confirmed) => {
+          if (signal.aborted) throw signal.reason
+          if (confirmed === null || (entry.unknown === 'batch' && confirmed.batch !== true)) {
+            throw new Error('invalid-session-controls')
+          }
+          entry.confirmed = confirmed
+          entry.unknown = undefined
+          entry.loadError = undefined
+          for (const [field, value] of Object.entries(entry.failed)) {
+            if (controlValue(confirmed, field) === value) delete entry.failed[field]
+          }
+          if (Object.keys(entry.failed).length === 0) entry.failure = undefined
+          publish()
+        }).catch((error) => {
+          if (!signal.aborted) {
+            entry.loadError = error
+            publish()
+          }
+          throw error
+        }).finally(() => {
+          entry.verifying = undefined
+          if (entry.refreshRequested) load(entry)
+        })
+        return entry.verifying
+      }
+
+      const discard = (entry) => {
+        entry.failed = {}
+        entry.failure = undefined
+        publish()
+      }
+
+      function confirmsBatch(result, base, changes) {
+        if (result?.batch !== true || base?.batch !== true) return false
+        const fields = ['speed', 'contextWindow', 'reasoningEffort']
+        return fields.every(field => controlValue(result, field) ===
+          (Object.hasOwn(changes, field) ? changes[field] : controlValue(base, field)))
+      }
+
+      const drain = async (session, cycle) => {
+        const { signal } = session
+        while (!signal.aborted && session.queue.length > 0) {
+          const batch = session.queue.shift()
+          const { entry, changes, base, predecessor, select } = batch
+          const remaining = { ...changes }
+          let error
+          try {
+            await verify(entry)
+            if (signal.aborted) return
+            if (base?.batch === true) {
+              const expectedRevision = predecessor?.receipt?.revision ?? base.revision
+              try {
+                batch.receipt = await requestSessionControls(entry.address, signal, { changes, expectedRevision })
+              } catch (error) {
+                if (!error.rejected) {
+                  entry.unknown = 'batch'
+                  batch.verifyBase = predecessor?.receipt ?? base
+                }
+                throw error
+              }
+              if (signal.aborted) return
+              entry.confirmed = batch.receipt
+            } else {
+              // A legacy Host keeps its independent writes and native effort selection.
+              for (const [field, value] of Object.entries(changes)) {
+                if (field === 'reasoningEffort') {
+                  const { provider, model } = entry.address
+                  const result = await select({ provider, model, ...(value === null ? {} : { reasoningEffort: value }) })
+                  if (result?.ok !== true) throw result?.error ?? new Error('Model selection unavailable')
+                } else {
+                  try {
+                    entry.confirmed = await requestSessionControls(entry.address, signal, { field, value })
+                  } catch (error) {
+                    if (!error.rejected) entry.unknown = 'legacy'
+                    throw error
+                  }
+                }
+                if (signal.aborted) return
+                delete remaining[field]
+              }
+            }
+            entry.loadError = undefined
+          } catch (failure) {
+            if (signal.aborted) return
+            error = failure
+          }
+          entry.pending.shift()
+          if (error !== undefined) {
+            // A newer queued choice supersedes a failed choice of the same field.
+            for (const [field, value] of Object.entries(remaining)) {
+              if (!entry.pending.some(item => Object.hasOwn(item.changes, field))) entry.failed[field] = value
+            }
+            cycle.error ??= error
+            const failure = { error, promise: Promise.reject(error) }
+            void failure.promise.catch(() => {})
+            entry.failure = failure
+            report('error.controlsSave', error)
+            publish()
+            if (entry.unknown) {
+              await verify(entry).catch(() => {})
+              if (!entry.unknown && confirmsBatch(entry.confirmed, batch.verifyBase, changes)) batch.receipt = entry.confirmed
+            } else load(entry)
+          } else {
+            if (Object.keys(entry.failed).length === 0) entry.failure = undefined
+            publish()
+            if (entry.refreshRequested) load(entry)
+          }
+        }
+        if (signal.aborted) return
+        session.cycle = undefined
+        active.delete(session)
+        if (cycle.error === undefined) cycle.resolve()
+        else cycle.reject(cycle.error)
+      }
+
+      return {
+        route,
+        load,
+        discard,
+        retry(entry) {
+          if (!entry.unknown) { load(entry); return }
+          void verify(entry).catch((error) => {
+            if (!entry.session.signal.aborted) report('error.controlsSave', error)
+          })
+        },
+        generation: () => generation,
+        getSnapshot: () => version,
+        subscribe(listener) {
+          listeners.add(listener)
+          return () => { listeners.delete(listener) }
+        },
+        commit(entry, changes, base, predecessor, select) {
+          const { session } = entry
+          if (session.signal.aborted) return
+          entry.reading = undefined
+          for (const field of Object.keys(changes)) delete entry.failed[field]
+          const batch = { entry, changes, base, predecessor, select }
+          entry.pending.push(batch)
+          session.queue.push(batch)
+          if (session.cycle === undefined) {
+            const cycle = {}
+            cycle.promise = new Promise((resolve, reject) => { Object.assign(cycle, { resolve, reject }) })
+            // A menu-only save still reports its failure when there is no send waiting.
+            void cycle.promise.catch(() => {})
+            session.cycle = cycle
+            active.add(session)
+            queueMicrotask(() => { void drain(session, cycle) })
+          }
+          publish()
+        },
+        wait(binding, selection, remind = false) {
+          const session = sessions.get(binding)
+          if (session === undefined) return
+          if (session.cycle) return session.cycle.promise
+          if (selection == null) return
+          const entry = session.routes.get(JSON.stringify([selection.provider, selection.model]))
+          if (!entry?.unknown) {
+            if (remind && entry?.failure) report('error.controlsSendBlocked', entry.failure.error)
+            return entry?.failure?.promise
+          }
+          return verify(entry).then(() => session.cycle?.promise ?? entry.failure?.promise, (error) => {
+            if (!session.signal.aborted) report('error.controlsSave', error)
+            throw error
+          })
+        },
+        reset() {
+          controller.abort(new Error('Session connection changed'))
+          for (const session of active) {
+            session.cycle.reject(session.signal.reason)
+            session.cycle = undefined
+            session.queue.length = 0
+          }
+          active.clear()
+          sessions = new WeakMap()
+          controller = new AbortController()
+          generation += 1
+          publish()
+        },
+      }
+    }
+
+    function DiscreteSlider({ field, label, options, value, disabled, edit }) {
       const index = Math.max(0, options.findIndex(option => option.value === value))
-      const shownIndex = preview?.options === options && preview.value === value && !disabled ? preview.index : index
-      const shown = options[shownIndex]
+      const shown = options[index]
       const unavailable = disabled || options.length < 2
-
-      const cancel = () => {
-        canceled.current = pointer.current !== null || keys.current.size > 0
-        previewRef.current = null
-        setPreview(null)
-      }
-      const finish = () => {
-        const selected = canceled.current || previewRef.current === null ? undefined : options[previewRef.current]
-        pointer.current = null
-        keys.current.clear()
-        cancel()
-        if (!unavailable && selected !== undefined && selected.selectable !== false && selected.value !== value) commit(selected.value)
-      }
-      useLayoutEffect(() => {
-        cancel()
-      }, [options, value, unavailable])
-
-      // The pointer can leave the range while dragging. Observe release anywhere in the page.
-      useEffect(() => {
-        const release = (event) => {
-          if (pointer.current === event.pointerId) finish()
-        }
-        const reset = () => {
-          cancel()
-          finish()
-        }
-        const cancelPointer = (event) => {
-          if (pointer.current === event.pointerId) reset()
-        }
-        window.addEventListener('pointerup', release)
-        window.addEventListener('pointercancel', cancelPointer)
-        window.addEventListener('blur', reset)
-        return () => {
-          window.removeEventListener('pointerup', release)
-          window.removeEventListener('pointercancel', cancelPointer)
-          window.removeEventListener('blur', reset)
-        }
-      })
 
       return h('label', { className: 't3mp-control-row' },
         h('span', { className: 't3mp-control-label' }, label),
         h('input', {
           className: 't3mp-control-slider',
           'data-t3mp-control': field,
-          type: 'range', min: 0, max: options.length - 1, step: 1, value: shownIndex,
+          type: 'range', min: 0, max: options.length - 1, step: 1, value: index,
           'aria-label': label,
           'aria-valuetext': shown.ariaLabel ?? shown.label,
           'aria-disabled': unavailable || undefined,
-          'aria-busy': saving || undefined,
           tabIndex: unavailable ? -1 : undefined,
-          onPointerDown: (event) => {
-            if (unavailable) event.preventDefault()
-            else if (event.button === 0 && event.isPrimary) pointer.current = event.pointerId
-          },
+          onPointerDown: (event) => { if (unavailable) event.preventDefault() },
           onChange: (event) => {
-            if (unavailable || canceled.current) return
-            previewRef.current = event.currentTarget.valueAsNumber
-            if (pointer.current === null && keys.current.size === 0) finish()
-            else setPreview({ options, value, index: previewRef.current })
+            const selected = options[event.currentTarget.valueAsNumber]
+            if (!unavailable && selected !== undefined && selected.selectable !== false) edit(selected.value)
           },
           onKeyDown: (event) => {
-            if (event.key === 'Escape' && (pointer.current !== null || keys.current.size > 0)) {
-              event.preventDefault()
-              event.stopPropagation()
-              cancel()
-            }
             if (!RANGE_KEYS.has(event.key)) return
             event.stopPropagation()
-            if (unavailable || pointer.current !== null) event.preventDefault()
-            else keys.current.add(event.key)
-          },
-          onKeyUp: (event) => {
-            if (keys.current.delete(event.key) && keys.current.size === 0) finish()
-          },
-          onBlur: () => {
-            keys.current.clear()
-            cancel()
+            if (unavailable) event.preventDefault()
           },
         }),
         h('span', { className: 't3mp-control-value', 'aria-hidden': true }, shown.label),
@@ -676,6 +810,14 @@ window.__ModuleLoader__.load({
 
     function ChevronDownIcon(props) {
       return icon(h('path', { d: 'm6 9 6 6 6-6' }), props)
+    }
+
+    function SpeedIcon({ speed }) {
+      return icon(h('path', { d: 'm13 2-9 12h7l-1 8 10-12h-7l1-8Z' }), {
+        width: 14, height: 14, strokeWidth: 1.7,
+        fill: speed === 'ultrafast' ? 'currentColor' : 'none',
+        className: 't3mp-trigger-speed', 'data-t3mp-speed': speed,
+      })
     }
 
     function CheckIcon(props) {
@@ -757,7 +899,7 @@ window.__ModuleLoader__.load({
      * @returns the seated control.
      */
     function ModelPicker({
-      locked, available, directory, load, select, favorites, routable, teamRemote, controlOperations,
+      locked, available, directory, load, select, favorites, routable, teamRemote, controlOperations, guard, getBinding,
       sessionId, useProjection, useSession, useSessions, t,
     }) {
       const state = useSnapshot(directory)
@@ -773,6 +915,7 @@ window.__ModuleLoader__.load({
       const [disableRequest, setDisableRequest] = useState(null)
 
       const [open, setOpen] = useState(false)
+      const [guardedBinding, setGuardedBinding] = useState(null)
       const [pane, setPane] = useState('favorites')
       const [query, setQuery] = useState('')
       const [highlight, setHighlight] = useState(0)
@@ -787,6 +930,11 @@ window.__ModuleLoader__.load({
       const rowRefs = useRef([])
       const toastSeq = useRef(0)
       const lastActionRef = useRef('load')
+      const openRef = useRef(false)
+      const draftRef = useRef(null)
+      const closeRef = useRef(null)
+      const waitRef = useRef(null)
+      const [, redrawDraft] = useState(0)
 
       const groups = state.groups
       const current = state.current
@@ -823,12 +971,6 @@ window.__ModuleLoader__.load({
         ? undefined
         : rowByKey.get(`${current.provider}\u0000${current.model}`)
       const reasoning = currentRow?.model.reasoning
-      const effectiveEffort = current?.reasoningEffort ?? reasoning?.defaultEffort
-      const effortLabel = reasoning === undefined
-        ? undefined
-        : effectiveEffort === undefined
-          ? t('effort.providerDefault')
-          : reasoning.efforts.find(level => level.id === effectiveEffort)?.name ?? effectiveEffort
 
       /** The provider list the rail renders, in catalog order. */
       const providers = useMemo(
@@ -894,20 +1036,36 @@ window.__ModuleLoader__.load({
         ? { sessionId, provider, model }
         : null, [available, sessionId, provider, model])
       const controlsLocked = locked || running || busy || teamPending
-      const sessionControls = useSessionControls({
-        address, revision: catalog.controlsRevision, open, locked: controlsLocked, select, controlOperations,
-      })
-      const { efforts, speed, contextWindow } = sessionControls.controls ?? {}
+      useSnapshot(controlOperations)
+      const binding = getBinding()
+      const generation = controlOperations.generation()
+      const entry = controlOperations.route(binding, address)
+      const confirmed = entry?.confirmed
+      const canGuard = binding != null && guardedBinding === binding
+      const batchEnabled = canGuard && confirmed?.batch === true
+      const pending = entry?.pending ?? []
+      const pendingChanges = Object.assign({}, ...pending.map(batch => batch.changes))
+      const values = {
+        reasoningEffort: batchEnabled ? confirmed.reasoningEffort : current?.reasoningEffort ?? null,
+        speed: confirmed?.speed?.value,
+        contextWindow: confirmed?.contextWindow?.value,
+        ...pendingChanges,
+      }
+      const draft = draftRef.current?.entry === entry ? draftRef.current : null
+      const editedValues = { ...values, ...draft?.changes }
+      const menuControls = draft === null ? confirmed : draft.base
+      const menuBatch = canGuard && menuControls?.batch === true
+      const { efforts, speed, contextWindow } = menuControls ?? {}
+      const loadingControls = entry !== null && confirmed === undefined && entry.loadError === undefined
       const options = useMemo(() => {
         const effortOptions = reasoning?.efforts
           .filter(level => level.id !== undefined && (efforts === undefined || efforts.includes(level.id)))
           .map(level => ({ value: level.id, label: level.name })) ?? []
-        if (reasoning !== undefined && reasoning.defaultEffort === undefined && efforts === undefined) {
-          effortOptions.unshift({ value: undefined, label: t('effort.providerDefault') })
-        }
-        if (effortOptions.length > 0 && !effortOptions.some(option => option.value === effectiveEffort)) {
-          // Preserve the actual selection if policy has since removed it from the choices.
-          effortOptions.unshift({ value: effectiveEffort, label: effortLabel, selectable: false })
+        // Legacy selection keeps its original effective default and list ordering.
+        if (reasoning !== undefined && menuBatch) {
+          effortOptions.push({ value: null, label: t('effort.providerDefault') })
+        } else if (reasoning !== undefined && reasoning.defaultEffort === undefined && efforts === undefined) {
+          effortOptions.unshift({ value: null, label: t('effort.providerDefault') })
         }
         return {
           effort: effortOptions,
@@ -918,7 +1076,18 @@ window.__ModuleLoader__.load({
             ariaLabel: t('contextWindow.tokens', { count: value }),
           })) ?? [],
         }
-      }, [reasoning, efforts, effectiveEffort, effortLabel, speed, contextWindow, t])
+      }, [reasoning, efforts, menuBatch, speed, contextWindow, t])
+      const effectiveEffort = values.reasoningEffort ?? reasoning?.defaultEffort
+      const effortLabel = reasoning === undefined ? undefined : effectiveEffort === undefined
+        ? t('effort.providerDefault')
+        : reasoning.efforts.find(level => level.id === effectiveEffort)?.name ?? effectiveEffort
+      const windowLabel = values.contextWindow === undefined ? undefined
+        : t('contextWindow.tokens', { count: values.contextWindow })
+      const speedLabel = values.speed === undefined ? undefined : t(`speed.${values.speed}`)
+      const controlLabels = [
+        windowLabel && t('trigger.control', { label: t('contextWindow.row'), value: windowLabel }),
+        speedLabel && t('trigger.control', { label: t('speed.row'), value: speedLabel }),
+      ].filter(Boolean)
       const waiting = current === null && state.status === 'loading'
 
       const modelLabel = waiting
@@ -941,15 +1110,46 @@ window.__ModuleLoader__.load({
         load()
       }, [load])
 
-      const close = useCallback((restoreFocus) => {
+      // Keep a synchronous draft for outside mousedown, blur, and beginSubmission.
+      const close = useCallback((restoreFocus, cancel = false) => {
+        if (!openRef.current) return
+        openRef.current = false
+        const closing = draftRef.current
+        draftRef.current = null
+        const latest = directory.getSnapshot().current
+        if (!cancel && closing !== null && closing.entry === entry && Object.keys(closing.changes).length > 0
+          && getBinding() === binding && latest?.provider === entry.address.provider && latest?.model === entry.address.model) {
+          controlOperations.commit(entry, closing.changes, closing.base, closing.predecessor, select)
+        }
         setOpen(false)
         setPane('favorites')
         setQuery('')
         setHighlight(0)
         if (restoreFocus === true) queueMicrotask(() => { triggerRef.current?.focus() })
-      }, [])
+      }, [binding, controlOperations, directory, entry, getBinding, select])
+
+      useLayoutEffect(() => {
+        closeRef.current = close
+        waitRef.current = () => controlOperations.wait(binding, directory.getSnapshot().current, true)
+      }, [binding, close, controlOperations, directory])
+      useLayoutEffect(() => {
+        const unregister = !available || binding == null ? undefined
+          : guard.register(binding, () => closeRef.current?.(), () => waitRef.current?.())
+        setGuardedBinding(unregister === undefined ? null : binding)
+        return unregister
+      }, [available, binding, generation, guard, controlOperations])
+      useLayoutEffect(() => {
+        if (draftRef.current !== null && draftRef.current.entry !== entry) close(false, true)
+      }, [entry, close])
+
+      // Load on selection and refresh, including while closed so inline status is available.
+      // Warm opens display cached values while the refresh runs.
+      useEffect(() => {
+        if (entry !== null) controlOperations.load(entry)
+      }, [entry, catalog.controlsRevision, controlOperations])
 
       const show = useCallback(() => {
+        openRef.current = true
         triggerRef.current?.focus()
         setPane(favoriteList.length > 0 ? 'favorites' : (current?.provider ?? 'favorites'))
         setQuery('')
@@ -957,19 +1157,43 @@ window.__ModuleLoader__.load({
         setOpen(true)
         reload()
         routable.load()
-      }, [current, favoriteList.length, reload, routable])
+        if (entry !== null) controlOperations.load(entry)
+      }, [controlOperations, current, entry, favoriteList.length, reload, routable])
 
       /** What the trigger click and the toggle chord both do. */
       const toggle = useCallback(() => {
-        if (open) close(true)
+        if (openRef.current) close(true)
         else show()
-      }, [close, open, show])
+      }, [close, show])
+
+      const edit = (field, value, restoring = false) => {
+        if (!openRef.current || entry === null || controlsLocked || loadingControls) return
+        const baseline = batchEnabled ? values : { ...values, reasoningEffort: effectiveEffort ?? null }
+        const editing = draftRef.current ?? {
+          entry, values: baseline, base: canGuard ? confirmed : null, predecessor: pending.at(-1), changes: {}, restored: new Set(),
+        }
+        if (editing.entry !== entry) return
+        if (restoring) editing.restored.add(field)
+        else editing.restored.delete(field)
+        if (editing.values[field] === value) delete editing.changes[field]
+        else editing.changes[field] = value
+        draftRef.current = editing
+        redrawDraft(count => count + 1)
+      }
+
+      const discardFailed = () => {
+        if (draft !== null) {
+          for (const field of draft.restored) delete draft.changes[field]
+          draft.restored.clear()
+        }
+        controlOperations.discard(entry)
+      }
 
       const reportFailure = useCallback((text) => {
         setToast({ seq: ++toastSeq.current, text })
       }, [])
 
-      const teamLocked = locked || busy || teamPending || sessionControls.pending || modelSelection === undefined
+      const teamLocked = locked || busy || teamPending || pending.length > 0 || modelSelection === undefined
       const confirmDisable = disableRequest?.sessionId === sessionId
       const saveTeam = async (enabled, onFailure) => {
         if (teamLocked || setTeamEnabled === undefined) return false
@@ -1009,47 +1233,60 @@ window.__ModuleLoader__.load({
         if (!teamPending) setDisableRequest(null)
       }
 
-      const submit = useCallback((selection) => {
-        lastActionRef.current = 'select'
-        triggerRef.current?.focus()
-        void select(selection).then((result) => {
-          if (result === undefined) return
-          if (result.ok) {
-            close(true)
+      const choosingModel = useRef(false)
+      const submit = useCallback(async (selection) => {
+        choosingModel.current = true
+        close(true)
+        try {
+          try {
+            await controlOperations.wait(binding, { provider, model })
+          } catch {
             return
           }
-          reportFailure(result.error.code === 'session/writer-held'
+          // A route or binding change can invalidate the selection while waiting.
+          const latest = directory.getSnapshot().current
+          if (getBinding() !== binding || entry?.session.signal.aborted
+            || latest?.provider !== provider || latest?.model !== model) return
+          lastActionRef.current = 'select'
+          const result = await select(selection)
+          if (result?.ok === false) throw result.error
+        } catch (error) {
+          reportFailure(error?.code === 'session/writer-held'
             ? t('error.sessionInUse')
-            : t('error.action', { message: `${result.error.code}: ${result.error.message}` }))
-        })
-      }, [close, reportFailure, select, t])
+            : t('error.action', { message: error?.code ? `${error.code}: ${error.message}` : controlErrorMessage(error, t) }))
+        } finally {
+          choosingModel.current = false
+        }
+      }, [binding, close, controlOperations, directory, entry, getBinding, model, provider, reportFailure, select, t])
 
       const chooseModel = useCallback((row) => {
-        if (locked || busy || sessionControls.pending) return
+        if (locked || busy || choosingModel.current) return
         let defaultEffort = row.model.reasoning?.defaultEffort
         if (provider === row.provider && model === row.model.id) {
-          if (effectiveEffort === undefined || options.effort.some(option => option.selectable !== false && option.value === effectiveEffort)) {
+          if (effectiveEffort === undefined || options.effort.some(option => option.value === effectiveEffort)) {
             close(true)
             return
           }
-          if (controlsLocked || sessionControls.loading) return
+          if (controlsLocked || loadingControls) return
           if (efforts !== undefined && !efforts.includes(defaultEffort)) {
-            defaultEffort = options.effort.find(option => option.selectable !== false)?.value
+            defaultEffort = options.effort.find(option => option.value !== null)?.value
           }
         }
-        submit({
+        void submit({
           provider: row.provider,
           model: row.model.id,
           ...defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort },
         })
-      }, [busy, close, controlsLocked, effectiveEffort, efforts, locked, model, options.effort, provider, sessionControls.loading, sessionControls.pending, submit])
+      }, [busy, close, controlsLocked, effectiveEffort, efforts, locked, model, options.effort, provider, loadingControls, submit])
 
       // Focus the search field whenever the card opens, mirroring T3.
       useLayoutEffect(() => {
         if (!open) return
         searchRef.current?.focus({ preventScroll: true })
         const frame = window.requestAnimationFrame(() => {
-          searchRef.current?.focus({ preventScroll: true })
+          if (panelRef.current?.contains(document.activeElement) !== true) {
+            searchRef.current?.focus({ preventScroll: true })
+          }
         })
         return () => { window.cancelAnimationFrame(frame) }
       }, [open])
@@ -1075,18 +1312,18 @@ window.__ModuleLoader__.load({
         const onMouseDown = (event) => {
           if (rootRef.current?.contains(event.target) === true) return
           if (panelRef.current?.contains(event.target) === true) return
-          setOpen(false)
+          close(false)
         }
         document.addEventListener('mousedown', onMouseDown)
         return () => { document.removeEventListener('mousedown', onMouseDown) }
-      }, [open])
+      }, [close, open])
 
       // Jump chords stay document-wide so a keystroke works while the composer
       // editor or a row holds focus.
       useEffect(() => {
         if (!open) return
         const onKeyDown = (event) => {
-          if (locked || busy || sessionControls.pending) return
+          if (locked || busy || choosingModel.current) return
           const index = jumpIndexFromEvent(event)
           if (index === null) return
           const row = visibleRows[index]
@@ -1097,7 +1334,7 @@ window.__ModuleLoader__.load({
         }
         window.addEventListener('keydown', onKeyDown, true)
         return () => { window.removeEventListener('keydown', onKeyDown, true) }
-      }, [chooseModel, locked, busy, sessionControls.pending, provider, open, visibleRows])
+      }, [chooseModel, locked, busy, provider, open, visibleRows])
 
       // Lend this seat to the document-wide toggle chord. The handle reads the
       // live DOM and the current props, so it is never stale between the
@@ -1119,12 +1356,14 @@ window.__ModuleLoader__.load({
           const rect = triggerRef.current?.getBoundingClientRect()
           if (rect === undefined) return
           const width = panelRef.current?.offsetWidth ?? PANEL_WIDTH
-          const height = panelRef.current?.offsetHeight ?? PANEL_MAX_HEIGHT
-          let left = rect.right - width
-          let top = rect.top - 8 - height
-          left = Math.min(Math.max(left, PANEL_MARGIN), window.innerWidth - width - PANEL_MARGIN)
-          top = Math.min(Math.max(top, PANEL_MARGIN), window.innerHeight - height - PANEL_MARGIN)
-          setMenuPos(previous => previous?.left === left && previous?.top === top ? previous : { left, top })
+          const above = rect.top - 8 - PANEL_MARGIN
+          const below = window.innerHeight - rect.bottom - 8 - PANEL_MARGIN
+          const fitsAbove = above >= Math.min(PANEL_MAX_HEIGHT, 160) || above >= below
+          const height = Math.max(1, Math.min(PANEL_MAX_HEIGHT, fitsAbove ? above : below))
+          const left = Math.min(Math.max(rect.right - width, PANEL_MARGIN), window.innerWidth - width - PANEL_MARGIN)
+          const top = fitsAbove ? Math.max(PANEL_MARGIN, rect.top - 8 - height) : rect.bottom + 8
+          setMenuPos(previous => previous?.left === left && previous?.top === top && previous?.height === height
+            ? previous : { left, top, height })
         }
         place()
         window.addEventListener('scroll', place, true)
@@ -1146,7 +1385,8 @@ window.__ModuleLoader__.load({
       const onPanelKeyDown = (event) => {
         if (event.key === 'Escape') {
           event.preventDefault()
-          close(true)
+          event.stopPropagation()
+          close(true, true)
           return
         }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -1178,7 +1418,7 @@ window.__ModuleLoader__.load({
           rootRef.current?.contains(event.relatedTarget) === true
           || panelRef.current?.contains(event.relatedTarget) === true
         )) return
-        setOpen(false)
+        close(false)
       }
 
       const railSelect = (id) => {
@@ -1215,7 +1455,7 @@ window.__ModuleLoader__.load({
           && current.provider === row.provider
           && current.model === row.model.id
         const label = jumpLabels.get(row.key)
-        const disabled = locked || busy || sessionControls.pending
+        const disabled = locked || busy
           || (row.unavailable && provider !== row.provider)
         return h('button', {
           key: row.key,
@@ -1335,7 +1575,7 @@ window.__ModuleLoader__.load({
       )
 
       const statusNodes = []
-      if (state.status === 'loading') {
+      if (state.status === 'loading' && groups.length === 0) {
         statusNodes.push(h('div', { className: 't3mp-status', key: 'loading' }, t('status.loading')))
       }
       if (state.error !== null && lastActionRef.current === 'load') {
@@ -1351,47 +1591,48 @@ window.__ModuleLoader__.load({
         ))
       }
 
-      const savedValues = { effort: effectiveEffort, speed: speed?.value, contextWindow: contextWindow?.value }
+      const sliderValues = {
+        effort: menuBatch ? editedValues.reasoningEffort : editedValues.reasoningEffort ?? reasoning?.defaultEffort ?? null,
+        speed: editedValues.speed,
+        contextWindow: editedValues.contextWindow,
+      }
       const controlRows = Object.entries(options).filter(([, choices]) => choices.length > 0).map(([field, choices]) => {
-        const saving = sessionControls.change?.field === field
+        const value = sliderValues[field]
+        const isListed = choices.some(choice => choice.value === value)
         return h(DiscreteSlider, {
           key: `${sessionId}\u0000${provider}\u0000${model}\u0000${field}`,
           field,
           label: t(`${field}.row`),
-          options: choices,
-          value: saving ? sessionControls.change.value : savedValues[field],
-          disabled: controlsLocked || sessionControls.loading || sessionControls.pending,
-          saving,
-          commit: value => {
-            if (field === 'effort') lastActionRef.current = 'select'
-            sessionControls.save(field, value)
-          },
+          options: isListed ? choices : [{ value, label: effortLabel, selectable: false }, ...choices],
+          value,
+          disabled: controlsLocked || entry === null || loadingControls || (field !== 'effort' && !canGuard),
+          edit: value => edit(field === 'effort' ? 'reasoningEffort' : field, value),
         })
       })
-      const saveError = sessionControls.saveError
-      const saveFeedback = saveError === null ? null : h('div', { className: 't3mp-error', role: 'alert' },
-        h('span', null, t('error.controlsSave', { field: t(`${saveError.field}.row`), message: controlErrorMessage(saveError.error, t) })),
-        h('button', {
-          type: 'button', className: 't3mp-retry', onClick: () => {
-            searchRef.current?.focus({ preventScroll: true })
-            sessionControls.dismissError()
-          },
-        }, t('action.dismiss')),
-      )
       let controlsFeedback = null
-      if (sessionControls.loadError !== undefined) {
+      if (entry?.loadError !== undefined) {
         controlsFeedback = h('div', { className: 't3mp-error', role: 'alert' },
-          h('span', null, t('error.controlsLoad', { message: controlErrorMessage(sessionControls.loadError, t) })),
+          h('span', null, t('error.controlsLoad', { message: controlErrorMessage(entry.loadError, t) })),
           h('button', {
-            type: 'button', className: 't3mp-retry', onClick: () => {
-              searchRef.current?.focus({ preventScroll: true })
-              sessionControls.retry()
-            },
+            type: 'button', className: 't3mp-retry', onClick: () => { controlOperations.retry(entry) },
           }, t('action.retry')),
         )
-      } else if (sessionControls.loading) {
+      } else if (loadingControls) {
         controlsFeedback = h('div', { className: 't3mp-status', role: 'status' }, t('status.controlsLoading'))
       }
+      const restorable = Object.entries(entry?.failed ?? {}).filter(([field, value]) => options[field === 'reasoningEffort' ? 'effort' : field]
+        .some(choice => choice.value === value))
+      const saveFeedback = entry?.failure === undefined ? null : h('div', { className: 't3mp-unsaved' },
+        restorable.length === 0 ? null : h('button', {
+          type: 'button', className: 't3mp-retry', disabled: controlsLocked,
+          onClick: () => {
+            for (const [field, value] of restorable) edit(field, value, true)
+          },
+        }, t('action.restoreControls')),
+        h('button', {
+          type: 'button', className: 't3mp-retry', onClick: discardFailed,
+        }, t('action.discardControls')),
+      )
 
       const panel = h('div', {
         ref: panelRef,
@@ -1436,10 +1677,10 @@ window.__ModuleLoader__.load({
           ref: triggerRef,
           type: 'button',
           className: 't3mp-trigger',
-          'aria-label': currentRow === undefined ? triggerAria : `${triggerAria} · ${currentRow.providerName}`,
+          'aria-label': [triggerAria, ...controlLabels, currentRow?.providerName].filter(Boolean).join(' · '),
           'aria-haspopup': 'dialog',
           'aria-expanded': open,
-          title: [triggerLabel, currentRow?.providerName, toggleLabel()].filter(Boolean).join(' · '),
+          title: [triggerLabel, ...controlLabels, currentRow?.providerName, toggleLabel()].filter(Boolean).join(' · '),
           disabled: locked,
           onClick: toggle,
         },
@@ -1453,6 +1694,10 @@ window.__ModuleLoader__.load({
           triggerUnavailable
             ? h('span', { className: 't3mp-badge' }, t('badge.unavailable'))
             : null,
+          values.contextWindow === undefined ? null : h('span', {
+            className: 't3mp-trigger-window', 'data-t3mp-window': values.contextWindow, 'aria-hidden': true,
+          }, values.contextWindow % 1000 === 0 ? t('contextWindow.short', { count: values.contextWindow / 1000 }) : String(values.contextWindow)),
+          speedLabel === undefined || values.speed === 'standard' ? null : h(SpeedIcon, { speed: values.speed }),
           h(ChevronDownIcon, { className: open ? 't3mp-chevron t3mp-chevron-open' : 't3mp-chevron' }),
         ),
         open ? ReactDOM.createPortal(panel, document.body) : null,
@@ -1501,6 +1746,10 @@ window.__ModuleLoader__.load({
   flex: 0 1 auto; min-width: 0; max-width: 45%; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap;
 }
+.t3mp-trigger-window, .t3mp-trigger-speed { flex: 0 0 auto; }
+.t3mp-trigger-window { font-variant-numeric: tabular-nums; font-size: 11px; white-space: nowrap; }
+.t3mp-trigger > .t3mp-badge { min-width: 0; flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; }
+.t3mp-unsaved { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 8px; font-size: 12px; }
 .t3mp-trigger-glyph, .t3mp-trigger-fallback { flex: 0 0 auto; }
 .t3mp-chevron { flex: 0 0 auto; color: var(--dsw-alias-label-caption); transition: transform 120ms ease; }
 .t3mp-chevron-open { transform: rotate(180deg); }
@@ -1651,6 +1900,177 @@ window.__ModuleLoader__.load({
 }
 `
 
+    // rc.5 shares the concrete Session between the composer and its slots.
+    // Use one adapter per Session even when the client bundle is reloaded.
+    function createSubmissionGuard(bindingFor) {
+      const key = Symbol.for('dsh-t3-model-picker/submission-guard-v1')
+      const owners = new Set()
+      let disposed = false
+
+      function waitFor(promise, signals) {
+        if (signals.some(signal => signal.aborted)) return Promise.resolve(false)
+        return new Promise(resolve => {
+          const finish = value => {
+            for (const signal of signals) signal.removeEventListener('abort', abort)
+            resolve(value)
+          }
+          const abort = () => finish(false)
+          for (const signal of signals) signal.addEventListener('abort', abort, { once: true })
+          Promise.resolve(promise).then(value => finish(value !== false), () => finish(false))
+        })
+      }
+
+      function readBarrier(owner) {
+        try {
+          owner.seal()
+          return owner.wait()
+        } catch (error) {
+          return Promise.reject(error)
+        }
+      }
+
+      function install(binding) {
+        const { session } = binding
+        const installed = session[key]
+        if (installed !== undefined) return installed
+        if (!Object.isExtensible(session) || typeof session.beginSubmission !== 'function' || typeof session.prompt !== 'function') return undefined
+        const originals = ['beginSubmission', 'prompt'].map(name => Object.getOwnPropertyDescriptor(session, name))
+        if (originals.some(descriptor => descriptor && !descriptor.configurable)) return undefined
+        const begin = session.beginSubmission
+        const prompt = session.prompt
+        const attempts = new Map()
+        const entry = { owner: undefined, carry: undefined, restore }
+        let waiting = 0
+        const methods = [['beginSubmission', beginSubmission], ['prompt', guardedPrompt]]
+
+        function restore() {
+          if (entry.owner || entry.carry || attempts.size || waiting) return
+          for (const [index, [name, method]] of methods.entries()) {
+            if (Object.getOwnPropertyDescriptor(session, name)?.value !== method) continue
+            if (originals[index]) Object.defineProperty(session, name, originals[index])
+            else delete session[name]
+          }
+          if (session[key] === entry) delete session[key]
+        }
+
+        function beginSubmission(...args) {
+          const handle = begin.apply(this, args)
+          const owner = entry.owner ?? entry.carry?.owner
+          if (this !== session || !owner) return handle
+          const signal = owner.connection.signal
+          const pending = readBarrier(owner)
+          const barrier = pending === undefined ? undefined : waitFor(pending, [signal])
+          const forget = () => {
+            if (!attempts.delete(handle.requestId)) return false
+            restore()
+            return true
+          }
+          const abandon = () => { if (forget()) handle.abandon() }
+          attempts.set(handle.requestId, { owner, signal, barrier, carried: entry.carry?.result, abandon, forget })
+          return { ...handle, abandon }
+        }
+
+        async function guardedPrompt(...args) {
+          const attempt = attempts.get(args[3])
+          const owner = attempt?.owner ?? entry.owner
+          if (this !== session) return prompt.apply(this, args)
+          if (!owner) {
+            const carried = entry.carry
+            if (carried && !await carried.result) return { ok: false, error: { code: 'session/controls-unconfirmed', message: 'Session settings were not confirmed' } }
+            if (entry.owner) return guardedPrompt.apply(this, args)
+            return prompt.apply(this, args)
+          }
+          const signals = [attempt?.signal ?? owner.connection.signal, ...args[2] ? [args[2]] : []]
+          const current = () => !signals.some(signal => signal.aborted) && owner.current()
+          const carried = entry.carry?.result ?? attempt?.carried
+          const stopped = () => {
+            attempt?.abandon()
+            return { ok: false, error: { code: 'session/controls-unconfirmed', message: 'Session settings were not confirmed' } }
+          }
+          waiting++
+          try {
+            if (!current()) return stopped()
+            if (carried && !await waitFor(carried, signals)) return stopped()
+            const pending = readBarrier(owner)
+            const latest = pending === undefined ? undefined : waitFor(pending, signals)
+            if (attempt?.barrier !== undefined && !await waitFor(attempt.barrier, signals)) return stopped()
+            if (latest !== undefined && !await latest) return stopped()
+            // A later settings edit can arrive during attachment serialization
+            // or while waiting. Recheck until the current operation settles.
+            let previous = pending
+            let next = owner.wait()
+            while (next !== undefined && next !== previous) {
+              if (!await waitFor(next, signals)) return stopped()
+              previous = next
+              next = owner.wait()
+            }
+            if (!current()) return stopped()
+            attempt?.forget()
+          } catch {
+            return stopped()
+          } finally {
+            waiting--
+            restore()
+          }
+          return prompt.apply(this, args)
+        }
+
+        for (const [name, method] of methods) Object.defineProperty(session, name, { value: method, configurable: true, writable: true })
+        Object.defineProperty(session, key, { value: entry, configurable: true })
+        return entry
+      }
+
+      function register(binding, seal, wait) {
+        if (!binding || disposed) return undefined
+        const entry = install(binding)
+        if (!entry) return undefined
+        const owner = {
+          seal, wait,
+          current: () => bindingFor(binding.sessionId) === binding,
+          connection: new AbortController(),
+          detach() {
+            owners.delete(owner)
+            owner.connection.abort()
+            if (entry.owner === owner) {
+              entry.owner = undefined
+              const pending = wait()
+              if (pending !== undefined) {
+                const carry = { owner, result: Promise.resolve(pending).then(() => true, () => false) }
+                entry.carry = carry
+                void carry.result.then(() => {
+                  if (entry.carry === carry) entry.carry = undefined
+                  entry.restore()
+                })
+              }
+            }
+            entry.restore()
+          },
+        }
+        entry.owner = owner
+        owners.add(owner)
+        return owner.detach
+      }
+
+      return {
+        register,
+        reset() {
+          for (const owner of owners) {
+            owner.connection.abort()
+            owner.connection = new AbortController()
+          }
+        },
+        dispose() {
+          disposed = true
+          for (const owner of owners) {
+            owner.connection.abort()
+            owner.detach()
+          }
+        },
+      }
+    }
+
+    // End submission guard
+
     // ------------------------------------------------------------------ apply
 
     /**
@@ -1678,8 +2098,19 @@ window.__ModuleLoader__.load({
 
       const favorites = createFavoritesStore()
       const routable = createRoutableStore(ctx.remote)
-      // Keep pending writes and failures across scoped seat remounts.
-      const controlOperations = { writes: new Map(), failures: new Map() }
+      const notices = createNoticeStore()
+      const controlOperations = createControlOperations(notices.report)
+      let connectionGeneration
+      const getBinding = (sessionId) => {
+        if (connectionGeneration !== undefined && connectionGeneration.getSnapshot() === undefined) return undefined
+        return ctx.sessions.binding?.(sessionId)
+      }
+      const guard = createSubmissionGuard(getBinding)
+      // The guard can still wait for an in-flight save from this factory during HMR.
+      ctx.effect(() => () => { guard.dispose() }, 't3-model-picker: submission guard')
+      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+        name: 'shell.overlay', id: 't3-model-picker.notice', locale: NS, inject: () => ({ notices }),
+      }, PickerNotice))
 
       // Keep the picker available on profiles that omit the Team remote.
       const teamListeners = new Set()
@@ -1703,7 +2134,34 @@ window.__ModuleLoader__.load({
       })
 
       const refresh = routable.refresh
-      ctx.on('connection/reset', refresh)
+      const invalidateControls = () => {
+        guard.reset()
+        controlOperations.reset()
+        notices.dismiss(notices.getSnapshot())
+      }
+      ctx.inject(['connection'], (scope) => {
+        scope.effect(() => {
+          const source = scope.connection?.generation
+          if (source === undefined) return
+          connectionGeneration = source
+          let previous = source.getSnapshot()?.id
+          const unsubscribe = source.subscribe(() => {
+            const current = source.getSnapshot()?.id
+            if (current === previous) return
+            const hadConnection = previous !== undefined
+            previous = current
+            if (hadConnection) invalidateControls()
+          })
+          return () => {
+            unsubscribe()
+            connectionGeneration = undefined
+          }
+        }, 't3-model-picker: connection generation')
+      })
+      ctx.on('connection/reset', () => {
+        invalidateControls()
+        refresh()
+      })
       ctx.remote.$on('llm/adapters-updated', refresh)
       ctx.remote.$on('settings/document-updated', refresh)
 
@@ -1748,6 +2206,8 @@ window.__ModuleLoader__.load({
             routable,
             teamRemote,
             controlOperations,
+            guard,
+            getBinding: () => getBinding(sessionId),
           }
         },
       }, ModelPicker))

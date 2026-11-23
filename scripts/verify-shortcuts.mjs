@@ -131,6 +131,7 @@ async function boot({ platform }) {
     apiCalls.push({ url: String(url), method: request.method })
     return new Response('Not found', { status: 404 })
   }
+  const bindings = new Map()
   const ctx = {
     effect(fn) { disposers.push(fn()) },
     on() {},
@@ -151,7 +152,7 @@ async function boot({ platform }) {
     slots: {
       inject(_name, loadSeat) { return loadSeat() },
       register(options, component) {
-        seat = { component, props: options.inject('session-1') }
+        if (options.name === 'conversation.input.model') seat = { component, props: options.inject('session-1') }
         return () => {}
       },
     },
@@ -164,7 +165,19 @@ async function boot({ platform }) {
         return { store, load: store.load, select: store.select }
       },
     },
-    sessions: { subagentAddress: () => undefined },
+    sessions: {
+      subagentAddress: () => undefined,
+      binding(sessionId) {
+        if (!bindings.has(sessionId)) bindings.set(sessionId, {
+          sessionId,
+          session: {
+            beginSubmission: () => ({ requestId: 'fixture', abandon() {} }),
+            prompt: async () => ({ ok: true }),
+          },
+        })
+        return bindings.get(sessionId)
+      },
+    },
   }
 
   const loaded = []

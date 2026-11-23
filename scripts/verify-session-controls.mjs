@@ -27,6 +27,8 @@ const delays = new Map()
 let availability = { speed: true, contextWindow: true }
 let efforts = ['low', 'high']
 let getOverride
+let batch = true
+let revision = 0
 const defaultControls = { speed: 'fast', contextWindow: 500000 }
 const readControls = (address) => {
   const pref = preferences.get(address) ?? defaultControls
@@ -34,6 +36,7 @@ const readControls = (address) => {
     ...(availability.speed ? { speed: { value: pref.speed, options: ['standard', 'fast', 'ultrafast'] } } : {}),
     ...(availability.contextWindow ? { contextWindow: { value: pref.contextWindow, options: [272000, 500000, 872000] } } : {}),
     efforts,
+    ...(batch && { batch: true, revision: String(revision), reasoningEffort: pref.reasoningEffort ?? null }),
   }
 }
 const deferred = () => {
@@ -52,7 +55,7 @@ try {
     const request = route.request()
     const url = new URL(request.url())
     if (url.pathname === '/dsh-test/session') {
-      await route.fulfill({ contentType: 'text/html', body: `<!doctype html><base href="${mount}"><div id="app" style="position: fixed; bottom: 12px; right: 12px"></div>` })
+      await route.fulfill({ contentType: 'text/html', body: `<!doctype html><base href="${mount}"><div id="app" style="position: fixed; bottom: 12px; right: 12px"></div><button id="outside">Outside</button><div id="overlays"></div>` })
       return
     }
     assert.equal(url.pathname, '/dsh-test/api/magpie-session-controls')
@@ -71,16 +74,19 @@ try {
       return
     }
     assert.equal(method, 'POST')
-    assert.deepEqual(Object.keys(data).sort(), ['field', 'model', 'provider', 'sessionId', 'value'])
-    const { field, value } = data
-    assert.ok(readControls(address)[field]?.options.includes(value))
+    const patch = data.changes ?? { [data.field]: data.value }
+    for (const [field, value] of Object.entries(patch)) {
+      assert.ok(field === 'reasoningEffort' ? value === null || efforts.includes(value) : readControls(address)[field]?.options.includes(value))
+    }
+    if (data.changes) assert.equal(data.expectedRevision, String(revision))
     await delays.get(`POST ${address}`)?.promise
     const error = denied.get(address)
     if (error !== undefined) {
       await route.fulfill({ status: 409, json: { ok: false, error } })
       return
     }
-    preferences.set(address, { ...defaultControls, ...preferences.get(address), [field]: value })
+    preferences.set(address, { ...defaultControls, ...preferences.get(address), ...patch })
+    revision++
     await route.fulfill({ json: { ok: true, value: readControls(address) } })
   })
   await page.goto(`${mount}session`)
@@ -91,6 +97,24 @@ try {
   await page.evaluate(({ provider, model, otherModel }) => {
     let definition
     let seat
+    let overlay
+    const bindings = new Map()
+    const sends = []
+    const abandons = []
+    let requestSequence = 0
+    function binding(sessionId) {
+      if (!bindings.has(sessionId)) bindings.set(sessionId, { sessionId, session: {
+        beginSubmission() {
+          const requestId = String(++requestSequence)
+          return { requestId, abandon: () => abandons.push(requestId) }
+        },
+        async prompt(content, mode, signal, requestId) {
+          sends.push({ sessionId, content, mode, requestId })
+          return { ok: true, value: { accepted: true } }
+        },
+      } })
+      return bindings.get(sessionId)
+    }
     let dictionary
     let revision = 0
     let selectError
@@ -142,20 +166,35 @@ try {
         $on: (name, handler) => handlers.set(name, handler),
         session: { modelCatalog: async () => ({ ok: true, value: { routableProviders: [provider] } }) },
       },
-      sessions: { subagentAddress: () => undefined },
+      sessions: { subagentAddress: () => undefined, binding },
       modelDirectories: { directoryFor: sessionId => {
         if (!directories.has(sessionId)) directories.set(sessionId, makeDirectory(sessionId))
         return directories.get(sessionId)
       } },
       slots: {
         inject: (_, fn) => fn(),
-        register: (options, component) => { seat = { options, component } },
+        register: (options, component) => {
+          if (options.name === 'conversation.input.model') seat = { options, component }
+          if (options.name === 'shell.overlay') overlay = { options, component }
+        },
       },
     })
     const root = ReactDOM.createRoot(document.querySelector('#app'))
+    const overlayRoot = ReactDOM.createRoot(document.querySelector('#overlays'))
+    const t = (name, params) => dictionary[name].replace(/\{(\w+)\}/g, (_, param) => params[param])
     window.fixture = {
+      send(sessionId) {
+        const session = binding(sessionId).session
+        const handle = session.beginSubmission({ text: 'preserve draft' })
+        window.lastSend = session.prompt([{ type: 'text', text: 'preserve draft' }], 'queue', undefined, handle.requestId)
+      },
+      sends, abandons,
       render(sessionId, running = false, remount = false) {
         if (remount) revision += 1
+        if (overlay) overlayRoot.render(h(overlay.component, {
+          ...overlay.options.inject?.(), t,
+          renderFactorySlot: (name, props) => h('p', { 'data-notice': name }, props.text),
+        }))
         root.render(h(seat.component, {
           ...seat.options.inject(sessionId), key: `${sessionId}:${revision}`, locked: false, sessionId,
           t: (name, params) => dictionary[name].replace(/\{(\w+)\}/g, (_, param) => params[param]),
@@ -188,6 +227,8 @@ try {
   await reopen()
   await waitValue('speed', 'Fast')
   await waitValue('contextWindow', '500000 tokens')
+  assert.equal(await trigger.locator('[data-t3mp-window]').textContent(), '500K')
+  assert.equal(await trigger.locator('[data-t3mp-speed]').getAttribute('data-t3mp-speed'), 'fast')
   assert.ok(await team.isVisible())
   const bounds = await panel.boundingBox()
   assert.ok(bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= 320 && bounds.y + bounds.height <= 244)
@@ -195,147 +236,128 @@ try {
   await team.scrollIntoViewIfNeeded()
   const teamBounds = await team.boundingBox()
   assert.ok(teamBounds.y >= 0 && teamBounds.y + teamBounds.height <= 244)
-
-  await effort.focus()
-  await page.keyboard.press('ArrowUp')
-  await waitValue('effort', 'low')
-  assert.deepEqual(await page.evaluate(() => window.fixture.selectCalls), [{ sessionId: sessionA, provider, model, reasoningEffort: 'low' }])
-  assert.equal(await effort.evaluate(element => document.activeElement === element), true)
-  await effort.focus()
-  await page.keyboard.down('End')
-  await page.waitForFunction(() => document.querySelector('[data-t3mp-control="effort"]').getAttribute('aria-valuetext') === 'high')
-  assert.equal(await page.evaluate(() => window.fixture.selectCalls.length), 1)
-  await page.keyboard.press('Escape')
-  await page.keyboard.up('End')
-  await waitValue('effort', 'low')
-  assert.ok(await panel.isVisible())
-
-  await speed.scrollIntoViewIfNeeded()
-  let rect = await speed.boundingBox()
-  await page.mouse.move(rect.x + rect.width / 2, rect.y + rect.height / 2)
-  await page.mouse.down()
-  await page.mouse.move(rect.x + rect.width - 3, rect.y + rect.height / 2, { steps: 6 })
-  await page.waitForFunction(() => document.querySelector('[data-t3mp-control="speed"]').getAttribute('aria-valuetext') === 'Ultrafast')
-  assert.equal(posts().length, 0)
-  await page.mouse.up()
-  await waitValue('speed', 'Ultrafast')
-  assert.deepEqual(posts()[0], { method: 'POST', sessionId: sessionA, provider, model, field: 'speed', value: 'ultrafast' })
-  assert.ok(await panel.isVisible())
-  await speed.scrollIntoViewIfNeeded()
-  rect = await speed.boundingBox()
-  await page.mouse.move(rect.x + rect.width - 3, rect.y + rect.height / 2)
-  await page.mouse.down()
-  await page.mouse.move(rect.x + 3, rect.y + rect.height / 2, { steps: 4 })
-  await page.waitForFunction(() => document.querySelector('[data-t3mp-control="speed"]').getAttribute('aria-valuetext') === 'Standard')
-  await page.keyboard.press('Escape')
-  await page.mouse.move(rect.x + rect.width / 2, rect.y + rect.height / 2, { steps: 3 })
-  await page.mouse.up()
-  await waitValue('speed', 'Ultrafast')
-  assert.equal(posts().length, 1)
-
-  await windowSize.focus()
-  await page.keyboard.press('End')
-  await waitValue('contextWindow', '872000 tokens')
-  assert.deepEqual(posts()[1], { method: 'POST', sessionId: sessionA, provider, model, field: 'contextWindow', value: 872000 })
-  await page.evaluate(sessionId => window.fixture.render(sessionId, true), sessionA)
-  await page.waitForFunction(() => [...document.querySelectorAll('[data-t3mp-control]')].every(input => input.getAttribute('aria-disabled') === 'true'))
-  await page.keyboard.press('Home')
-  await speed.scrollIntoViewIfNeeded()
-  rect = await speed.boundingBox()
-  await page.mouse.click(rect.x + 3, rect.y + rect.height / 2)
-  assert.equal(posts().length, 2)
-  await page.evaluate(sessionId => window.fixture.render(sessionId), sessionA)
-  await page.waitForFunction(() => document.querySelector('[data-t3mp-control="speed"]').getAttribute('aria-disabled') !== 'true')
-
-  denied.set(key(sessionA), 'Session is already running')
-  const delayedWrite = deferred()
-  delays.set(`POST ${key(sessionA)}`, delayedWrite)
-  await speed.focus()
-  await page.keyboard.press('Home')
-  await page.waitForFunction(() => document.querySelector('[data-t3mp-control="speed"]').getAttribute('aria-busy') === 'true')
-  const previousReads = gets(key(sessionA)).length
-  await page.evaluate(sessionId => window.fixture.render(sessionId), sessionB)
-  await reopen()
-  await waitValue('speed', 'Fast')
-  assert.ok(gets(key(sessionB)).length > 0)
-  await page.evaluate(sessionId => window.fixture.render(sessionId), sessionA)
   await trigger.click()
-  await panel.getByText('Loading session controls…').waitFor()
-  assert.equal(gets(key(sessionA)).length, previousReads)
-  delayedWrite.release()
-  await waitValue('speed', 'Ultrafast')
-  await panel.getByRole('alert').getByText(/Session is already running/).waitFor()
-  assert.equal(posts().length, 3)
-  await panel.getByRole('button', { name: 'Dismiss' }).click()
-  await panel.getByRole('alert').waitFor({ state: 'detached' })
-  denied.clear()
+  await panel.waitFor({ state: 'hidden' })
+  await reopen()
 
+  const closePicker = async () => {
+    await page.mouse.click(3, 3) // Outside the popup's minimum viewport margin.
+    await panel.waitFor({ state: 'hidden' })
+  }
+  const choose = async (slider, keyboard) => { await slider.focus(); await page.keyboard.press(keyboard) }
+  const counts = () => page.evaluate(() => [window.fixture.sends.length, window.fixture.abandons.length])
+  const send = () => page.evaluate(sessionId => window.fixture.send(sessionId), sessionA)
+  const sendOutcome = () => page.evaluate(() => window.lastSend)
+  const waitPosts = size => assert.equal(posts().length, size)
+
+  await choose(effort, 'Home')
+  await choose(speed, 'End')
+  await choose(windowSize, 'End')
+  await waitValue('speed', 'Ultrafast')
+  await waitValue('contextWindow', '872000 tokens')
+  waitPosts(0)
+  const slow = deferred()
+  delays.set(`POST ${key(sessionA)}`, slow)
+  const firstPost = page.waitForRequest(request => request.method() === 'POST')
+  await send()
+  await panel.waitFor({ state: 'hidden' })
+  await firstPost
+  waitPosts(1)
+  assert.deepEqual(posts()[0].changes, { reasoningEffort: 'low', speed: 'ultrafast', contextWindow: 872000 })
+  assert.deepEqual(await counts(), [0, 0])
+  slow.release()
+  assert.equal((await sendOutcome()).ok, true)
+  assert.deepEqual(await counts(), [1, 0])
+  assert.equal(await trigger.locator('[data-t3mp-window]').textContent(), '872K')
+  assert.equal(await trigger.locator('[data-t3mp-speed]').getAttribute('data-t3mp-speed'), 'ultrafast')
+  delays.delete(`POST ${key(sessionA)}`)
+
+  await reopen()
+  await waitValue('speed', 'Ultrafast')
+  await choose(speed, 'Home')
+  await page.keyboard.press('Escape')
+  await panel.waitFor({ state: 'hidden' })
+  waitPosts(1)
+  await reopen()
+  await waitValue('speed', 'Ultrafast')
+  denied.set(key(sessionA), 'Rejected by fixture')
+  await choose(speed, 'Home')
+  await choose(windowSize, 'Home')
+  await send()
+  assert.equal((await sendOutcome()).ok, false)
+  assert.deepEqual(await counts(), [1, 1])
+  assert.match(await page.locator('[data-notice="workspace.toast.content"]').textContent(), /Rejected by fixture/)
+  await send()
+  assert.equal((await sendOutcome()).ok, false)
+  assert.deepEqual(await counts(), [1, 2])
+  assert.match(await page.locator('[data-notice="workspace.toast.content"]').textContent(), /restore or discard unsaved settings/)
+  await reopen()
+  await waitValue('speed', 'Ultrafast')
+  await waitValue('contextWindow', '872000 tokens')
+  assert.ok(await panel.locator('.t3mp-main').evaluate(element => element.scrollWidth <= element.clientWidth))
+  await panel.getByRole('button', { name: 'Restore unsaved changes' }).click()
+  await waitValue('speed', 'Standard')
+  await panel.getByRole('button', { name: 'Discard unsaved changes' }).click()
+  await waitValue('speed', 'Ultrafast')
+  await closePicker()
+  waitPosts(2)
+  denied.delete(key(sessionA))
+
+  for (const [enableSpeed, enableWindow] of [[true,false], [false,true], [false,false], [true,true]]) {
+    availability = { speed:enableSpeed, contextWindow:enableWindow }
+    await page.evaluate(sessionId => window.fixture.render(sessionId, false, true), sessionB + `${enableSpeed}-${enableWindow}`)
+    await trigger.click()
+    await effort.waitFor()
+    if (enableSpeed) await speed.waitFor()
+    if (enableWindow) await windowSize.waitFor()
+    await page.waitForFunction(() => !document.querySelector('.t3mp-status'))
+    assert.equal(await speed.count(), Number(enableSpeed))
+    assert.equal(await windowSize.count(), Number(enableWindow))
+    assert.equal(await trigger.locator('[data-t3mp-speed]').count(), Number(enableSpeed))
+    assert.equal(await trigger.locator('[data-t3mp-window]').count(), Number(enableWindow))
+    await closePicker()
+  }
+
+  const flagSession = sessionB + '-flag-refresh'
+  const heldRead = deferred()
+  delays.set(`GET ${key(flagSession)}`, heldRead)
+  const initialRead = page.waitForRequest(request => request.url().includes(flagSession))
+  await page.evaluate(sessionId => window.fixture.render(sessionId, false, true), flagSession)
+  await initialRead
   availability = { speed: false, contextWindow: true }
   await page.evaluate(() => window.fixture.refresh())
-  await speed.waitFor({ state: 'detached' })
-  await waitValue('contextWindow', '872000 tokens')
-  availability = { speed: true, contextWindow: false }
-  await page.evaluate(() => window.fixture.refresh())
-  await windowSize.waitFor({ state: 'detached' })
-  await waitValue('speed', 'Ultrafast')
-  availability = { speed: false, contextWindow: false }
-  await page.evaluate(() => window.fixture.refresh())
-  await speed.waitFor({ state: 'detached' })
-  await waitValue('effort', 'low')
-  assert.equal(await panel.getByRole('slider').count(), 1)
-
-  getOverride = () => ({ json: { ok: true, value: { contextWindow: { options: ['500000'], value: '500000' } } } })
-  await page.evaluate(() => window.fixture.refresh())
-  await panel.getByRole('button', { name: 'Retry' }).waitFor()
-  assert.equal(await panel.getByRole('slider').count(), 1)
-  await panel.getByText('Could not load session controls: Invalid session controls response').waitFor()
-  getOverride = () => ({ status: 404, json: { ok: false, error: 'Session is not active' } })
-  await panel.getByRole('button', { name: 'Retry' }).click()
-  await panel.getByText('Could not load session controls: Session is not active').waitFor()
-  assert.equal(await panel.getByRole('textbox').evaluate(element => document.activeElement === element), true)
-
+  await page.evaluate(() => new Promise(requestAnimationFrame))
+  delays.delete(`GET ${key(flagSession)}`)
+  heldRead.release()
+  await page.waitForFunction(() => document.querySelector('[data-t3mp-window]') && !document.querySelector('[data-t3mp-speed]'))
+  assert.equal(gets(key(flagSession)).length, 2)
   availability = { speed: true, contextWindow: true }
-  const delayedRead = deferred()
-  getOverride = address => address === key(sessionA) ? { json: { ok: true, value: {} } } : undefined
-  delays.set(`GET ${key(sessionA)}`, delayedRead)
-  const oldRequest = page.waitForRequest(request => {
-    const query = new URL(request.url()).searchParams
-    return request.method() === 'GET' && query.get('sessionId') === sessionA && query.get('model') === model
-  })
-  await panel.getByRole('button', { name: 'Retry' }).click()
-  await oldRequest
-  await panel.getByText('Loading session controls…').waitFor()
-  await page.evaluate(({ sessionId, otherModel }) => window.fixture.update(sessionId, { model: otherModel }), { sessionId: sessionA, otherModel })
-  await waitValue('speed', 'Fast')
-  delayedRead.release()
-  await waitValue('contextWindow', '500000 tokens')
-  assert.ok(gets(key(sessionA, otherModel)).length > 0)
 
-  efforts = ['high']
-  await page.evaluate(() => { window.fixture.failSelect('Reasoning update refused'); window.fixture.refresh() })
-  await waitValue('speed', 'Fast')
-  const selectionCount = await page.evaluate(() => window.fixture.selectCalls.length)
-  await effort.focus()
-  await page.keyboard.press('End')
-  await panel.getByText('Could not save Reasoning effort: Reasoning update refused').waitFor()
-  await waitValue('effort', 'low')
-  assert.equal(await effort.evaluate(element => document.activeElement === element), true)
-  await page.evaluate(() => window.fixture.failSelect(undefined))
-  await page.keyboard.press('End')
-  await waitValue('effort', 'high')
-  assert.equal(await effort.getAttribute('aria-disabled'), 'true')
-  assert.deepEqual((await page.evaluate(() => window.fixture.selectCalls)).slice(selectionCount), [
-    { sessionId: sessionA, provider, model: otherModel, reasoningEffort: 'high' },
-    { sessionId: sessionA, provider, model: otherModel, reasoningEffort: 'high' },
-  ])
-  await page.evaluate(sessionId => window.fixture.update(sessionId, { reasoningEffort: 'low' }), sessionA)
-  await waitValue('effort', 'low')
-  const selectedModel = panel.getByRole('menuitemradio', { name: new RegExp(otherModel) })
-  await selectedModel.click()
-  await panel.waitFor({ state: 'hidden' })
-  assert.deepEqual((await page.evaluate(() => window.fixture.selectCalls)).at(-1), { sessionId: sessionA, provider, model: otherModel, reasoningEffort: 'high' })
+  batch = false
+  await page.evaluate(sessionId => window.fixture.render(sessionId, false, true), sessionB)
+  await trigger.click()
+  await speed.waitFor()
+  await choose(speed, 'End')
+  const legacyPost = page.waitForRequest(request => request.method() === 'POST')
+  await closePicker()
+  assert.deepEqual((await legacyPost).postDataJSON(), { sessionId: sessionB, provider, model, field: 'speed', value: 'ultrafast' })
+  getOverride = () => ({ status: 404, json: null })
+  await page.evaluate(sessionId => window.fixture.render(sessionId, false, true), sessionB + '-no-api')
+  await trigger.click()
+  await effort.waitFor()
+  await choose(effort, 'End')
+  await closePicker()
+  await page.waitForFunction(() => window.fixture.selectCalls.some(selection => selection.reasoningEffort === 'high'))
+  getOverride = () => ({ status: 503, json: { ok: false, error: 'Capability lookup unavailable' } })
+  await page.evaluate(sessionId => window.fixture.render(sessionId, false, true), sessionB + '-lookup-error')
+  await trigger.click()
+  await panel.getByText(/Capability lookup unavailable/).waitFor()
+  assert.notEqual(await effort.getAttribute('aria-disabled'), 'true')
+  await choose(effort, 'Home')
+  await closePicker()
+  await page.waitForFunction(() => window.fixture.selectCalls.some(selection => selection.sessionId.endsWith('-lookup-error') && selection.reasoningEffort === 'low'))
   assert.deepEqual(pageErrors, [])
-  console.log('Chromium passed: keyboard and pointer preview/commit/cancel, owner cookie and mounted API, narrow panel, running lock, delayed write failure across remount, four capability combinations, invalid DTO, and stale model reads.')
+  console.log(`T3 browser regression passed (${gets(key(sessionA)).length} reads, ${posts().length} writes)`)
 } finally {
   await browser.close()
 }
