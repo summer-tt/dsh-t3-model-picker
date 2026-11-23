@@ -44,9 +44,8 @@ Harness's model directory. Please support the original project.
 - **Unavailable models.** Providers the host does not report as routable are
   marked on their rows, on the rail tile's tooltip, and on the trigger.
 - **Reasoning effort.** The composer button shows the current effort beside the
-  model name when the model advertises effort levels. The picker footer opens
-  those levels. In the composer's compact layout, the button retains the
-  effort and its tooltip shows both the model and effort.
+  model name when the model advertises effort levels. A discrete slider in the picker footer selects the effort supported by the current model. In compact layout the button retains the effort and its tooltip shows both the model and effort.
+- **Session speed and context window.** A compatible Magpie Connect host adds two sliders for configured base models. Speed requests Standard, Fast or Ultrafast. The context slider sets the local token budget. Each slider appears when its corresponding host control is enabled. Select a base model such as `codex/gpt-6.2-sol` to use them. Existing group routes keep their own model IDs.
 - **Agent teamwork.** The picker footer shows a root session's saved Team
   setting when the host exposes Agent Teams. The switch is available regardless
   of the model's effort levels. Disabling Team after a model request opens
@@ -54,7 +53,7 @@ Harness's model directory. Please support the original project.
 
 ## Install
 
-Install the fork's packaged release into the Web profile:
+For the session controls, install the matching local T3 and Magpie Connect bundles in the Web profile. The earlier logo-only release can be installed with:
 
 ```sh
 dsh plugin --profile web add https://github.com/summer-tt/dsh-t3-model-picker/releases/download/fork-1.1.3-logos.1/dsh-t3-model-picker.tgz

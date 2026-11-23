@@ -19,8 +19,8 @@
  * the visible list. Four deliberate departures:
  *   - search results are grouped under provider headings, where T3 renders one
  *     flat ranked list;
- *   - a footer row keeps the reasoning-effort selector reachable, since the
- *     shadowed seat was the only surface that exposed it in the composer;
+ *   - footer sliders expose the session's reasoning effort, request speed,
+ *     and context window when the current model supports them;
  *   - the row of the model in use carries a check mark, because this seat is
  *     single-select and the trigger is not always in view;
  *   - Cmd/Ctrl+Shift+M opens and closes the card, which T3 leaves to the
@@ -70,10 +70,21 @@ window.__ModuleLoader__.load({
       'error.action': 'Model selection failed: {message}',
       'error.sessionInUse': 'This session is already in use, possibly by another running DSH instance (such as dsh web or the desktop app). Quit other running DSH instances and try again.',
       'action.retry': 'Retry',
-      'effort.row': 'Effort',
-      'effort.title': 'Reasoning effort',
+      'action.dismiss': 'Dismiss',
+      'effort.row': 'Reasoning effort',
       'effort.providerDefault': 'Default',
-      'effort.back': 'Back to models',
+      'speed.row': 'Speed',
+      'speed.standard': 'Standard',
+      'speed.fast': 'Fast',
+      'speed.ultrafast': 'Ultrafast',
+      'contextWindow.row': 'Context window',
+      'contextWindow.short': '{count}K',
+      'contextWindow.tokens': '{count} tokens',
+      'status.controlsLoading': 'Loading session controls…',
+      'error.controlsLoad': 'Could not load session controls: {message}',
+      'error.controlsSave': 'Could not save {field}: {message}',
+      'error.controlsInvalid': 'Invalid session controls response',
+      'error.controlsTimeout': 'Request timed out',
       'team.label': 'Enable agent teamwork',
       'team.disableTitle': 'Disable agent teamwork?',
       'team.disableDescription': 'Disabling agent teamwork during a conversation stops the use of shared task tools and team coordination instructions.',
@@ -105,10 +116,21 @@ window.__ModuleLoader__.load({
       'error.action': '模型切换失败：{message}',
       'error.sessionInUse': '当前会话已被占用，可能是其他正在运行的 DSH 导致的（如其他 dsh web、桌面端），请退出其他正在运行的 DSH 后重试。',
       'action.retry': '重试',
+      'action.dismiss': '关闭提示',
       'effort.row': '推理等级',
-      'effort.title': '推理等级',
       'effort.providerDefault': '默认',
-      'effort.back': '返回模型列表',
+      'speed.row': '速度',
+      'speed.standard': '标准',
+      'speed.fast': '快速',
+      'speed.ultrafast': '极速',
+      'contextWindow.row': '上下文窗口',
+      'contextWindow.short': '{count}K',
+      'contextWindow.tokens': '{count} tokens',
+      'status.controlsLoading': '正在加载会话控件…',
+      'error.controlsLoad': '会话控件加载失败：{message}',
+      'error.controlsSave': '{field}保存失败：{message}',
+      'error.controlsInvalid': '会话控件返回的数据无效',
+      'error.controlsTimeout': '请求超时',
       'team.label': '启用智能体团队协作',
       'team.disableTitle': '确认停用智能体团队协作？',
       'team.disableDescription': '对话过程中停用智能体团队协作，将停止共享任务工具和团队协调指令。',
@@ -345,11 +367,11 @@ window.__ModuleLoader__.load({
      * @returns a snapshot store of `{ status, providers }`.
      */
     function createRoutableStore(remote) {
-      let value = { status: 'idle', providers: [] }
+      let value = { status: 'idle', providers: [], controlsRevision: 0 }
       const listeners = new Set()
       let inflight
       const publish = (next) => {
-        value = next
+        value = { ...value, ...next }
         for (const listener of [...listeners]) listener()
       }
       const load = () => {
@@ -375,7 +397,259 @@ window.__ModuleLoader__.load({
           return () => { listeners.delete(listener) }
         },
         load,
+        refresh() {
+          publish({ controlsRevision: value.controlsRevision + 1 })
+          void load()
+        },
       }
+    }
+
+    // --------------------------------------------------------- session controls
+
+    const SPEEDS = new Set(['standard', 'fast', 'ultrafast'])
+    const RANGE_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowDown', 'ArrowUp', 'Home', 'End', 'PageDown', 'PageUp'])
+
+    function record(value) {
+      return value !== null && typeof value === 'object' && !Array.isArray(value)
+    }
+
+    function validOptions(options, validate) {
+      return Array.isArray(options) && options.every(validate) && new Set(options).size === options.length
+    }
+
+    function validControl(control, validate) {
+      return record(control) && validOptions(control.options, validate) && control.options.includes(control.value)
+    }
+
+    function validControls(value) {
+      return record(value)
+        && (value.speed === undefined || validControl(value.speed, speed => SPEEDS.has(speed)))
+        && (value.contextWindow === undefined || validControl(value.contextWindow, tokens => Number.isSafeInteger(tokens) && tokens > 0))
+        && (value.efforts === undefined || validOptions(value.efforts, effort => typeof effort === 'string' && effort.trim() === effort && effort.length > 0))
+    }
+
+    async function requestSessionControls(address, signal, change) {
+      // Use the current Host's mount and owner cookie, like Magpie's settings page.
+      const url = new URL('api/magpie-session-controls', document.baseURI)
+      if (change === undefined) url.search = new URLSearchParams(address).toString()
+      const timeout = AbortSignal.timeout(10_000)
+      const response = await fetch(url, {
+        method: change === undefined ? 'GET' : 'POST',
+        headers: { accept: 'application/json', ...change === undefined ? {} : { 'content-type': 'application/json' } },
+        ...change === undefined ? {} : { body: JSON.stringify({ ...address, ...change }) },
+        mode: 'same-origin',
+        credentials: 'same-origin',
+        redirect: 'error',
+        cache: 'no-store',
+        signal: signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
+      })
+      const payload = await response.json().catch(() => undefined)
+      const hostError = payload?.ok === false && typeof payload.error === 'string'
+      // A Host that predates the endpoint falls back to the native model directory.
+      if (change === undefined && !hostError && (response.status === 404 || response.status === 405)) return {}
+      if (!response.ok || payload?.ok === false) {
+        throw new Error(typeof payload?.error === 'string' && payload.error.length > 0 ? payload.error : `HTTP ${response.status}`)
+      }
+      if (payload?.ok !== true || !validControls(payload.value) || (change !== undefined && payload.value[change.field]?.value !== change.value)) {
+        throw new Error('invalid-session-controls')
+      }
+      return payload.value
+    }
+
+    function controlErrorMessage(error, t) {
+      if (error?.message === 'invalid-session-controls') return t('error.controlsInvalid')
+      if (error?.name === 'TimeoutError') return t('error.controlsTimeout')
+      if (error?.code === 'session/writer-held') return t('error.sessionInUse')
+      return error?.message ?? String(error)
+    }
+
+    function useSessionControls({ address, revision, open, locked, select, controlOperations }) {
+      const { writes, failures } = controlOperations
+      const [retry, setRetry] = useState(0)
+      const [result, setResult] = useState(null)
+      const [, redraw] = useState(0)
+      const [pending, setPending] = useState(() => new Map())
+      const active = useRef(null)
+      const addressKey = address === null ? null : JSON.stringify(address)
+      const scope = useMemo(() => open && address !== null ? { address, addressKey } : null, [address, addressKey, open, retry, revision])
+
+      const updatePending = (key, operation) => setPending(previous => {
+        const next = new Map(previous)
+        if (operation === null) next.delete(key)
+        else next.set(key, operation)
+        return next
+      })
+
+      useLayoutEffect(() => {
+        active.current = scope
+        return () => { active.current = null }
+      }, [scope])
+
+      useEffect(() => {
+        if (scope === null) return
+        const controller = new AbortController()
+        const load = async () => {
+          // A quick close/reopen can race a write that the Host has already started.
+          await writes.get(scope.addressKey)
+          if (controller.signal.aborted) return
+          try {
+            const controls = await requestSessionControls(scope.address, controller.signal)
+            if (active.current === scope) setResult({ scope, controls })
+          } catch (error) {
+            if (active.current === scope) setResult({ scope, error })
+          }
+        }
+        void load()
+        return () => { controller.abort() }
+      }, [scope, writes])
+
+      const save = (field, value) => {
+        if (locked || scope === null || active.current !== scope || writes.has(scope.addressKey)) return
+        const change = { field, value }
+        failures.delete(scope.addressKey)
+        updatePending(scope.addressKey, { scope, change })
+        const operation = Promise.resolve().then(async () => {
+          if (active.current !== scope) return
+          try {
+            if (field === 'effort') {
+              const outcome = await select({
+                provider: scope.address.provider,
+                model: scope.address.model,
+                ...value === undefined ? {} : { reasoningEffort: value },
+              })
+              if (outcome?.ok !== true) throw outcome?.error ?? new Error('Model selection unavailable')
+            } else {
+              const controls = await requestSessionControls(scope.address, undefined, change)
+              if (active.current === scope) setResult({ scope, controls })
+            }
+          } catch (error) {
+            failures.set(scope.addressKey, { field, error })
+            if (active.current !== scope) return
+            updatePending(scope.addressKey, { scope })
+            if (field !== 'effort') {
+              // A request can fail after committing, or the Host can change capabilities.
+              const controls = await requestSessionControls(scope.address).catch(() => undefined)
+              if (controls !== undefined && active.current === scope) setResult({ scope, controls })
+            }
+          }
+        }).finally(() => {
+          writes.delete(scope.addressKey)
+          updatePending(scope.addressKey, null)
+        })
+        writes.set(scope.addressKey, operation)
+      }
+
+      const currentResult = result?.scope === scope ? result : null
+      const currentPending = pending.get(addressKey)
+      return {
+        controls: currentResult?.controls,
+        loadError: currentResult?.error,
+        saveError: failures.get(addressKey) ?? null,
+        dismissError: () => {
+          if (failures.delete(addressKey)) redraw(count => count + 1)
+        },
+        retry: () => {
+          failures.delete(addressKey)
+          setRetry(count => count + 1)
+        },
+        loading: scope !== null && currentResult === null,
+        pending: currentPending !== undefined,
+        change: currentPending?.scope === scope ? currentPending.change : undefined,
+        save,
+      }
+    }
+
+    function DiscreteSlider({ field, label, options, value, disabled, saving, commit }) {
+      const [preview, setPreview] = useState(null)
+      const previewRef = useRef(null)
+      const pointer = useRef(null)
+      const keys = useRef(new Set())
+      const canceled = useRef(false)
+      const index = Math.max(0, options.findIndex(option => option.value === value))
+      const shownIndex = preview?.options === options && preview.value === value && !disabled ? preview.index : index
+      const shown = options[shownIndex]
+      const unavailable = disabled || options.length < 2
+
+      const cancel = () => {
+        canceled.current = pointer.current !== null || keys.current.size > 0
+        previewRef.current = null
+        setPreview(null)
+      }
+      const finish = () => {
+        const selected = canceled.current || previewRef.current === null ? undefined : options[previewRef.current]
+        pointer.current = null
+        keys.current.clear()
+        cancel()
+        if (!unavailable && selected !== undefined && selected.selectable !== false && selected.value !== value) commit(selected.value)
+      }
+      useLayoutEffect(() => {
+        cancel()
+      }, [options, value, unavailable])
+
+      // The pointer can leave the range while dragging. Observe release anywhere in the page.
+      useEffect(() => {
+        const release = (event) => {
+          if (pointer.current === event.pointerId) finish()
+        }
+        const reset = () => {
+          cancel()
+          finish()
+        }
+        const cancelPointer = (event) => {
+          if (pointer.current === event.pointerId) reset()
+        }
+        window.addEventListener('pointerup', release)
+        window.addEventListener('pointercancel', cancelPointer)
+        window.addEventListener('blur', reset)
+        return () => {
+          window.removeEventListener('pointerup', release)
+          window.removeEventListener('pointercancel', cancelPointer)
+          window.removeEventListener('blur', reset)
+        }
+      })
+
+      return h('label', { className: 't3mp-control-row' },
+        h('span', { className: 't3mp-control-label' }, label),
+        h('input', {
+          className: 't3mp-control-slider',
+          'data-t3mp-control': field,
+          type: 'range', min: 0, max: options.length - 1, step: 1, value: shownIndex,
+          'aria-label': label,
+          'aria-valuetext': shown.ariaLabel ?? shown.label,
+          'aria-disabled': unavailable || undefined,
+          'aria-busy': saving || undefined,
+          tabIndex: unavailable ? -1 : undefined,
+          onPointerDown: (event) => {
+            if (unavailable) event.preventDefault()
+            else if (event.button === 0 && event.isPrimary) pointer.current = event.pointerId
+          },
+          onChange: (event) => {
+            if (unavailable || canceled.current) return
+            previewRef.current = event.currentTarget.valueAsNumber
+            if (pointer.current === null && keys.current.size === 0) finish()
+            else setPreview({ options, value, index: previewRef.current })
+          },
+          onKeyDown: (event) => {
+            if (event.key === 'Escape' && (pointer.current !== null || keys.current.size > 0)) {
+              event.preventDefault()
+              event.stopPropagation()
+              cancel()
+            }
+            if (!RANGE_KEYS.has(event.key)) return
+            event.stopPropagation()
+            if (unavailable || pointer.current !== null) event.preventDefault()
+            else keys.current.add(event.key)
+          },
+          onKeyUp: (event) => {
+            if (keys.current.delete(event.key) && keys.current.size === 0) finish()
+          },
+          onBlur: () => {
+            keys.current.clear()
+            cancel()
+          },
+        }),
+        h('span', { className: 't3mp-control-value', 'aria-hidden': true }, shown.label),
+      )
     }
 
     // ------------------------------------------------------------------ icons
@@ -402,10 +676,6 @@ window.__ModuleLoader__.load({
 
     function ChevronDownIcon(props) {
       return icon(h('path', { d: 'm6 9 6 6 6-6' }), props)
-    }
-
-    function ChevronRightIcon(props) {
-      return icon(h('path', { d: 'm9 18 6-6-6-6' }), props)
     }
 
     function CheckIcon(props) {
@@ -487,7 +757,7 @@ window.__ModuleLoader__.load({
      * @returns the seated control.
      */
     function ModelPicker({
-      locked, available, directory, load, select, favorites, routable, teamRemote,
+      locked, available, directory, load, select, favorites, routable, teamRemote, controlOperations,
       sessionId, useProjection, useSession, useSessions, t,
     }) {
       const state = useSnapshot(directory)
@@ -497,6 +767,7 @@ window.__ModuleLoader__.load({
       const teamMode = useProjection('agentTeam')
       const modelSelection = useProjection('modelSelection')
       const addressedChild = useSession(snapshot => snapshot.subagent !== null)
+      const running = useSession(snapshot => snapshot.running === true)
       const listedChild = useSessions(snapshot => snapshot.byId[sessionId]?.origin === 'subagent')
       const [teamPending, setTeamPending] = useState(false)
       const [disableRequest, setDisableRequest] = useState(null)
@@ -609,35 +880,45 @@ window.__ModuleLoader__.load({
         return { grouped: false, sections: [], rows }
       }, [allRows, pane, query, searching])
 
-      const effortChoices = useMemo(() => {
-        if (reasoning === undefined) return []
-        return [
-          ...reasoning.defaultEffort === undefined
-            ? [{ key: 'provider-default', effort: undefined, label: t('effort.providerDefault') }]
-            : [],
-          ...reasoning.efforts.map(level => ({ key: `effort:${level.id}`, effort: level.id, label: level.name })),
-        ]
-      }, [reasoning, t])
-
-      const showEffortRow = reasoning !== undefined && pane !== 'effort'
-      const effortPane = pane === 'effort'
-
-      /** Flattened display order: what the keyboard and the jump chords index into. */
-      const visibleRows = useMemo(() => (effortPane
-        ? effortChoices.map(choice => ({ kind: 'effort', choice }))
-        : listed.rows.map(row => ({ kind: 'model', row }))), [effortChoices, effortPane, listed.rows])
+      const visibleRows = listed.rows
 
       /** Cmd/Ctrl+1..9 for the first nine visible rows. */
-      const jumpLabels = useMemo(() => {
-        const labels = new Map()
-        for (let index = 0; index < Math.min(JUMP_COUNT, visibleRows.length); index += 1) {
-          const entry = visibleRows[index]
-          labels.set(entry.kind === 'model' ? entry.row.key : entry.choice.key, jumpLabel(index))
-        }
-        return labels
-      }, [visibleRows])
+      const jumpLabels = useMemo(() => new Map(visibleRows.slice(0, JUMP_COUNT)
+        .map((row, index) => [row.key, jumpLabel(index)])), [visibleRows])
 
-      const busy = state.status === 'selecting'
+      const busy = state.pending != null || state.status === 'selecting'
+      const provider = current?.provider
+      const model = current?.model
+      const address = useMemo(() => available && typeof sessionId === 'string' && sessionId.length > 0
+        && typeof provider === 'string' && typeof model === 'string'
+        ? { sessionId, provider, model }
+        : null, [available, sessionId, provider, model])
+      const controlsLocked = locked || running || busy || teamPending
+      const sessionControls = useSessionControls({
+        address, revision: catalog.controlsRevision, open, locked: controlsLocked, select, controlOperations,
+      })
+      const { efforts, speed, contextWindow } = sessionControls.controls ?? {}
+      const options = useMemo(() => {
+        const effortOptions = reasoning?.efforts
+          .filter(level => level.id !== undefined && (efforts === undefined || efforts.includes(level.id)))
+          .map(level => ({ value: level.id, label: level.name })) ?? []
+        if (reasoning !== undefined && reasoning.defaultEffort === undefined && efforts === undefined) {
+          effortOptions.unshift({ value: undefined, label: t('effort.providerDefault') })
+        }
+        if (effortOptions.length > 0 && !effortOptions.some(option => option.value === effectiveEffort)) {
+          // Preserve the actual selection if policy has since removed it from the choices.
+          effortOptions.unshift({ value: effectiveEffort, label: effortLabel, selectable: false })
+        }
+        return {
+          effort: effortOptions,
+          speed: speed?.options.map(value => ({ value, label: t(`speed.${value}`) })) ?? [],
+          contextWindow: contextWindow?.options.map(value => ({
+            value,
+            label: value % 1000 === 0 ? t('contextWindow.short', { count: value / 1000 }) : String(value),
+            ariaLabel: t('contextWindow.tokens', { count: value }),
+          })) ?? [],
+        }
+      }, [reasoning, efforts, effectiveEffort, effortLabel, speed, contextWindow, t])
       const waiting = current === null && state.status === 'loading'
 
       const modelLabel = waiting
@@ -688,7 +969,7 @@ window.__ModuleLoader__.load({
         setToast({ seq: ++toastSeq.current, text })
       }, [])
 
-      const teamLocked = locked || busy || teamPending || modelSelection === undefined
+      const teamLocked = locked || busy || teamPending || sessionControls.pending || modelSelection === undefined
       const confirmDisable = disableRequest?.sessionId === sessionId
       const saveTeam = async (enabled, onFailure) => {
         if (teamLocked || setTeamEnabled === undefined) return false
@@ -744,37 +1025,24 @@ window.__ModuleLoader__.load({
       }, [close, reportFailure, select, t])
 
       const chooseModel = useCallback((row) => {
-        if (current !== null && current.provider === row.provider && current.model === row.model.id) {
-          close(true)
-          return
+        if (locked || busy || sessionControls.pending) return
+        let defaultEffort = row.model.reasoning?.defaultEffort
+        if (provider === row.provider && model === row.model.id) {
+          if (effectiveEffort === undefined || options.effort.some(option => option.selectable !== false && option.value === effectiveEffort)) {
+            close(true)
+            return
+          }
+          if (controlsLocked || sessionControls.loading) return
+          if (efforts !== undefined && !efforts.includes(defaultEffort)) {
+            defaultEffort = options.effort.find(option => option.selectable !== false)?.value
+          }
         }
         submit({
           provider: row.provider,
           model: row.model.id,
-          ...row.model.reasoning?.defaultEffort === undefined
-            ? {}
-            : { reasoningEffort: row.model.reasoning.defaultEffort },
+          ...defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort },
         })
-      }, [close, current, submit])
-
-      const chooseEffort = useCallback((effort) => {
-        if (current === null) return
-        if (effectiveEffort === effort) {
-          close(true)
-          return
-        }
-        submit({
-          provider: current.provider,
-          model: current.model,
-          ...effort === undefined ? {} : { reasoningEffort: effort },
-        })
-      }, [close, current, effectiveEffort, submit])
-
-      const activate = useCallback((entry) => {
-        if (entry === undefined) return
-        if (entry.kind === 'effort') chooseEffort(entry.choice.effort)
-        else chooseModel(entry.row)
-      }, [chooseEffort, chooseModel])
+      }, [busy, close, controlsLocked, effectiveEffort, efforts, locked, model, options.effort, provider, sessionControls.loading, sessionControls.pending, submit])
 
       // Focus the search field whenever the card opens, mirroring T3.
       useLayoutEffect(() => {
@@ -818,19 +1086,18 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!open) return
         const onKeyDown = (event) => {
-          if (busy) return
+          if (locked || busy || sessionControls.pending) return
           const index = jumpIndexFromEvent(event)
           if (index === null) return
-          const entry = visibleRows[index]
-          if (entry === undefined) return
-          if (entry.kind === 'model' && entry.row.unavailable && entry.row.provider !== current?.provider) return
+          const row = visibleRows[index]
+          if (row === undefined || (row.unavailable && row.provider !== provider)) return
           event.preventDefault()
           event.stopPropagation()
-          activate(entry)
+          chooseModel(row)
         }
         window.addEventListener('keydown', onKeyDown, true)
         return () => { window.removeEventListener('keydown', onKeyDown, true) }
-      }, [activate, busy, current, open, visibleRows])
+      }, [chooseModel, locked, busy, sessionControls.pending, provider, open, visibleRows])
 
       // Lend this seat to the document-wide toggle chord. The handle reads the
       // live DOM and the current props, so it is never stale between the
@@ -857,7 +1124,7 @@ window.__ModuleLoader__.load({
           let top = rect.top - 8 - height
           left = Math.min(Math.max(left, PANEL_MARGIN), window.innerWidth - width - PANEL_MARGIN)
           top = Math.min(Math.max(top, PANEL_MARGIN), window.innerHeight - height - PANEL_MARGIN)
-          setMenuPos({ left, top })
+          setMenuPos(previous => previous?.left === left && previous?.top === top ? previous : { left, top })
         }
         place()
         window.addEventListener('scroll', place, true)
@@ -866,7 +1133,7 @@ window.__ModuleLoader__.load({
           window.removeEventListener('scroll', place, true)
           window.removeEventListener('resize', place)
         }
-      }, [open, pane, query, state, listed])
+      }, [open])
 
       if (!available) return null
 
@@ -879,10 +1146,6 @@ window.__ModuleLoader__.load({
       const onPanelKeyDown = (event) => {
         if (event.key === 'Escape') {
           event.preventDefault()
-          if (effortPane) {
-            setPane('favorites')
-            return
-          }
           close(true)
           return
         }
@@ -904,7 +1167,8 @@ window.__ModuleLoader__.load({
         if (event.key === 'Enter') {
           if (document.activeElement === searchRef.current) {
             event.preventDefault()
-            activate(visibleRows[highlight])
+            const row = visibleRows[highlight]
+            if (row !== undefined && (!row.unavailable || row.provider === provider)) chooseModel(row)
           }
         }
       }
@@ -951,8 +1215,8 @@ window.__ModuleLoader__.load({
           && current.provider === row.provider
           && current.model === row.model.id
         const label = jumpLabels.get(row.key)
-        const disabled = busy
-          || (row.unavailable && current?.provider !== row.provider)
+        const disabled = locked || busy || sessionControls.pending
+          || (row.unavailable && provider !== row.provider)
         return h('button', {
           key: row.key,
           ref: (node) => { rowRefs.current[index] = node },
@@ -1001,38 +1265,6 @@ window.__ModuleLoader__.load({
         )
       }
 
-      const renderEffortRow = (choice, index) => {
-        const isSelected = effectiveEffort === choice.effort
-        const label = jumpLabels.get(choice.key)
-        return h('button', {
-          key: choice.key,
-          ref: (node) => { rowRefs.current[index] = node },
-          type: 'button',
-          role: 'menuitemradio',
-          'aria-checked': isSelected,
-          'data-t3mp-row': '',
-          className: [
-            't3mp-row',
-            isSelected && 't3mp-row-selected',
-            highlight === index && 't3mp-row-active',
-          ].filter(Boolean).join(' '),
-          disabled: busy,
-          onMouseEnter: () => { setHighlight(index) },
-          onMouseDown: (event) => { event.preventDefault() },
-          onClick: () => { chooseEffort(choice.effort) },
-        },
-          h('span', { className: 't3mp-row-main' },
-            h('span', { className: 't3mp-row-title' },
-              h('span', { className: 't3mp-row-name' }, choice.label),
-            ),
-          ),
-          h('span', { className: 't3mp-row-end' },
-            isSelected ? h(CheckIcon, { className: 't3mp-check' }) : null,
-            label !== undefined ? h('kbd', { className: 't3mp-kbd' }, label) : null,
-          ),
-        )
-      }
-
       const renderSection = (section) => h('div', { className: 't3mp-section', key: section.id },
         h('div', { className: 't3mp-section-head' },
           h('span', { className: 't3mp-section-name' }, section.name),
@@ -1041,11 +1273,9 @@ window.__ModuleLoader__.load({
         section.rows.map(row => renderModelRow(row, listed.rows.indexOf(row))),
       )
 
-      const resultNodes = effortPane
-        ? visibleRows.map((entry, index) => renderEffortRow(entry.choice, index))
-        : listed.grouped
-          ? listed.sections.map(renderSection)
-          : listed.rows.map((row, index) => renderModelRow(row, index))
+      const resultNodes = listed.grouped
+        ? listed.sections.map(renderSection)
+        : visibleRows.map((row, index) => renderModelRow(row, index))
 
       const empty = state.status === 'ready' && visibleRows.length === 0
 
@@ -1105,45 +1335,63 @@ window.__ModuleLoader__.load({
       )
 
       const statusNodes = []
-      if (effortPane) {
-        statusNodes.push(h('div', { className: 't3mp-pane-head', key: 'pane-head' },
-          h('button', {
-            type: 'button',
-            className: 't3mp-back',
-            onMouseDown: (event) => { event.preventDefault() },
-            onClick: () => { setPane('favorites') },
-          }, h(ChevronRightIcon, { className: 't3mp-back-icon' }), t('effort.back')),
-          h('span', { className: 't3mp-pane-title' }, t('effort.title')),
+      if (state.status === 'loading') {
+        statusNodes.push(h('div', { className: 't3mp-status', key: 'loading' }, t('status.loading')))
+      }
+      if (state.error !== null && lastActionRef.current === 'load') {
+        statusNodes.push(h('div', { className: 't3mp-error', key: 'error' },
+          h('span', {}, t('error.load', { message: state.error })),
+          h('button', { type: 'button', className: 't3mp-retry', onClick: reload }, t('action.retry')),
         ))
-      } else {
-        if (state.status === 'loading') {
-          statusNodes.push(h('div', { className: 't3mp-status', key: 'loading' }, t('status.loading')))
-        }
-        if (state.error !== null && lastActionRef.current === 'load') {
-          statusNodes.push(h('div', { className: 't3mp-error', key: 'error' },
-            h('span', {}, t('error.load', { message: state.error })),
-            h('button', { type: 'button', className: 't3mp-retry', onClick: reload }, t('action.retry')),
-          ))
-        }
-        for (const failure of state.failures) {
-          statusNodes.push(h('div', { className: 't3mp-warning', key: `failure:${failure.id}` },
-            h('span', {}, t('warning.groupLoad', { name: failure.name, message: failure.message })),
-            h('button', { type: 'button', className: 't3mp-retry', onClick: reload }, t('action.retry')),
-          ))
-        }
+      }
+      for (const failure of state.failures) {
+        statusNodes.push(h('div', { className: 't3mp-warning', key: `failure:${failure.id}` },
+          h('span', {}, t('warning.groupLoad', { name: failure.name, message: failure.message })),
+          h('button', { type: 'button', className: 't3mp-retry', onClick: reload }, t('action.retry')),
+        ))
       }
 
-      const effortRow = showEffortRow && h('button', {
-        type: 'button',
-        className: 't3mp-effort-row',
-        disabled: current === null,
-        onMouseDown: (event) => { event.preventDefault() },
-        onClick: () => { setPane('effort') },
-      },
-        h('span', { className: 't3mp-effort-label' }, t('effort.row')),
-        h('span', { className: 't3mp-effort-value' }, effortLabel ?? ''),
-        h(ChevronRightIcon, { className: 't3mp-effort-chevron' }),
+      const savedValues = { effort: effectiveEffort, speed: speed?.value, contextWindow: contextWindow?.value }
+      const controlRows = Object.entries(options).filter(([, choices]) => choices.length > 0).map(([field, choices]) => {
+        const saving = sessionControls.change?.field === field
+        return h(DiscreteSlider, {
+          key: `${sessionId}\u0000${provider}\u0000${model}\u0000${field}`,
+          field,
+          label: t(`${field}.row`),
+          options: choices,
+          value: saving ? sessionControls.change.value : savedValues[field],
+          disabled: controlsLocked || sessionControls.loading || sessionControls.pending,
+          saving,
+          commit: value => {
+            if (field === 'effort') lastActionRef.current = 'select'
+            sessionControls.save(field, value)
+          },
+        })
+      })
+      const saveError = sessionControls.saveError
+      const saveFeedback = saveError === null ? null : h('div', { className: 't3mp-error', role: 'alert' },
+        h('span', null, t('error.controlsSave', { field: t(`${saveError.field}.row`), message: controlErrorMessage(saveError.error, t) })),
+        h('button', {
+          type: 'button', className: 't3mp-retry', onClick: () => {
+            searchRef.current?.focus({ preventScroll: true })
+            sessionControls.dismissError()
+          },
+        }, t('action.dismiss')),
       )
+      let controlsFeedback = null
+      if (sessionControls.loadError !== undefined) {
+        controlsFeedback = h('div', { className: 't3mp-error', role: 'alert' },
+          h('span', null, t('error.controlsLoad', { message: controlErrorMessage(sessionControls.loadError, t) })),
+          h('button', {
+            type: 'button', className: 't3mp-retry', onClick: () => {
+              searchRef.current?.focus({ preventScroll: true })
+              sessionControls.retry()
+            },
+          }, t('action.retry')),
+        )
+      } else if (sessionControls.loading) {
+        controlsFeedback = h('div', { className: 't3mp-status', role: 'status' }, t('status.controlsLoading'))
+      }
 
       const panel = h('div', {
         ref: panelRef,
@@ -1160,8 +1408,10 @@ window.__ModuleLoader__.load({
           statusNodes,
           h('div', { className: 't3mp-list scrollable' }, resultNodes),
           empty ? h('div', { className: 't3mp-empty' }, t('empty.models')) : null,
-          effortRow,
-          open && !effortPane && !addressedChild && !listedChild && teamMode !== undefined && setTeamEnabled !== undefined
+          controlsFeedback,
+          saveFeedback,
+          controlRows,
+          open && !addressedChild && !listedChild && teamMode !== undefined && setTeamEnabled !== undefined
             ? h('label', { className: 't3mp-team-row' },
               t('team.label'),
               h('input', {
@@ -1294,7 +1544,7 @@ window.__ModuleLoader__.load({
 .t3mp-rail-divider { height: 1px; margin: 0 2px 4px; background: var(--dsw-alias-border-l1); }
 .t3mp-rail-icon { color: var(--dsw-alias-label-primary); }
 
-.t3mp-main { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; overflow: hidden; background: color-mix(in srgb, var(--dsw-alias-bg-layer-2) 40%, transparent); }
+.t3mp-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; flex: 1 1 auto; overflow-y: auto; background: color-mix(in srgb, var(--dsw-alias-bg-layer-2) 40%, transparent); }
 .t3mp-main-full { border-left: none; }
 .t3mp-rail + .t3mp-main { border-left: 1px solid var(--dsw-alias-border-l1); }
 
@@ -1311,8 +1561,8 @@ window.__ModuleLoader__.load({
 }
 .t3mp-search-input::placeholder { color: var(--dsw-alias-label-caption); }
 
-.t3mp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 6px 2px 6px 8px; }
-.t3mp-status, .t3mp-empty { padding: 12px 12px; color: var(--dsw-alias-label-caption); font-size: 12px; }
+.t3mp-list { flex: 1 1 auto; min-height: 56px; overflow-y: auto; overscroll-behavior: contain; padding: 6px 2px 6px 8px; }
+.t3mp-status, .t3mp-empty { flex: 0 0 auto; padding: 12px 12px; color: var(--dsw-alias-label-caption); font-size: 12px; }
 .t3mp-error, .t3mp-warning {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   margin: 6px 8px; padding: 6px 8px; border-radius: 8px; font-size: 12px;
@@ -1361,17 +1611,20 @@ window.__ModuleLoader__.load({
 .t3mp-row:hover .t3mp-star, .t3mp-row-active .t3mp-star { opacity: 1; }
 .t3mp-star-on { opacity: 1; color: #eab308; }
 
-.t3mp-effort-row {
-  display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
-  margin: 0; padding: 8px 12px; border: none; border-top: 1px solid var(--dsw-alias-border-l1);
-  background: transparent; color: var(--dsw-alias-label-secondary);
-  font-family: inherit; font-size: 12px; cursor: pointer; text-align: left;
+.t3mp-control-row {
+  display: grid; grid-template-columns: minmax(0, 6em) minmax(28px, 1fr) minmax(0, 6em);
+  align-items: center; gap: 8px; flex: 0 0 auto;
+  min-height: 34px; padding: 4px 12px; border-top: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-primary); font-size: 12px;
 }
-.t3mp-effort-row:hover:not(:disabled) { background: color-mix(in srgb, var(--dsw-specific-menu) 88%, var(--dsw-alias-label-primary)); }
-.t3mp-effort-row:disabled { opacity: 0.5; cursor: default; }
-.t3mp-effort-label { flex: 0 0 auto; color: var(--dsw-alias-label-caption); }
-.t3mp-effort-value { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-primary); }
-.t3mp-effort-chevron { flex: 0 0 auto; color: var(--dsw-alias-label-caption); }
+.t3mp-control-label { color: var(--dsw-alias-label-caption); overflow-wrap: anywhere; }
+.t3mp-control-value { text-align: right; overflow-wrap: anywhere; }
+.t3mp-control-slider {
+  width: 100%; min-width: 0; margin: 0; height: 24px;
+  accent-color: var(--dsw-alias-brand-primary); cursor: pointer;
+}
+.t3mp-control-slider:focus-visible { outline: 2px solid var(--dsw-alias-border-l3); outline-offset: 1px; border-radius: 4px; }
+.t3mp-control-slider[aria-disabled="true"] { opacity: 0.5; cursor: default; }
 .t3mp-team-row {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   flex: 0 0 auto; padding: 8px 12px; border-top: 1px solid var(--dsw-alias-border-l1);
@@ -1386,14 +1639,6 @@ window.__ModuleLoader__.load({
 .t3mp-disable-copy p { margin: 0; }
 .t3mp-disable-copy p + p { margin-top: 12px; }
 .t3mp-disable-error { color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
-
-.t3mp-pane-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px 4px; flex: 0 0 auto; }
-.t3mp-back {
-  display: inline-flex; align-items: center; gap: 4px; border: none; background: transparent;
-  color: var(--dsw-alias-link); font-family: inherit; font-size: 12px; cursor: pointer; padding: 0;
-}
-.t3mp-back-icon { transform: rotate(180deg); }
-.t3mp-pane-title { font-size: 11px; font-weight: 600; color: var(--dsw-alias-label-caption); }
 
 .t3mp-trigger-glyph, .t3mp-rail-glyph { width: 16px; height: 16px; flex: 0 0 auto; }
 .t3mp-rail-glyph { width: 20px; height: 20px; }
@@ -1433,6 +1678,8 @@ window.__ModuleLoader__.load({
 
       const favorites = createFavoritesStore()
       const routable = createRoutableStore(ctx.remote)
+      // Keep pending writes and failures across scoped seat remounts.
+      const controlOperations = { writes: new Map(), failures: new Map() }
 
       // Keep the picker available on profiles that omit the Team remote.
       const teamListeners = new Set()
@@ -1455,7 +1702,7 @@ window.__ModuleLoader__.load({
         })
       })
 
-      const refresh = () => { void routable.load() }
+      const refresh = routable.refresh
       ctx.on('connection/reset', refresh)
       ctx.remote.$on('llm/adapters-updated', refresh)
       ctx.remote.$on('settings/document-updated', refresh)
@@ -1500,6 +1747,7 @@ window.__ModuleLoader__.load({
             favorites,
             routable,
             teamRemote,
+            controlOperations,
           }
         },
       }, ModelPicker))

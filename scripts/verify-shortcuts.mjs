@@ -125,6 +125,12 @@ async function boot({ platform }) {
   let teamError
   const team = createStore({ enabled: false })
   const teamCalls = []
+  const previousFetch = globalThis.fetch
+  const apiCalls = []
+  globalThis.fetch = async (url, request) => {
+    apiCalls.push({ url: String(url), method: request.method })
+    return new Response('Not found', { status: 404 })
+  }
   const ctx = {
     effect(fn) { disposers.push(fn()) },
     on() {},
@@ -152,7 +158,7 @@ async function boot({ platform }) {
     modelDirectories: {
       directoryFor: () => {
         const store = createStore(
-          { status: 'ready', groups: GROUPS, current: CURRENT, failures: [] },
+          { status: 'ready', groups: GROUPS, current: CURRENT, failures: [], error: null },
           { load: () => Promise.resolve(), select: () => Promise.resolve({ ok: true }) },
         )
         return { store, load: store.load, select: store.select }
@@ -220,7 +226,7 @@ async function boot({ platform }) {
   const click = async (node) => { await act(async () => { node.click() }) }
 
   return {
-    window, act, render, press, click, t, team, teamCalls,
+    window, act, render, press, click, t, team, teamCalls, apiCalls,
     failTeam: (message) => { teamError = message },
     panels: () => window.document.querySelectorAll('.t3mp-panel').length,
     triggers: () => window.document.querySelectorAll('.t3mp-trigger'),
@@ -228,6 +234,7 @@ async function boot({ platform }) {
     search: () => window.document.querySelector('.t3mp-search input'),
     unmount: async () => { await act(async () => { root.unmount() }) },
     dispose: () => {
+      globalThis.fetch = previousFetch
       for (const dispose of disposers.reverse()) {
         if (typeof dispose === 'function') dispose()
       }
@@ -247,7 +254,7 @@ async function main() {
   const triggerEffort = () => mac.triggers()[0].querySelector('.t3mp-trigger-effort')
   check('the closed trigger displays the current effort', triggerEffort()?.textContent === 'Medium')
 
-  const directory = createStore({ status: 'ready', groups: GROUPS, current: CURRENT, failures: [] })
+  const directory = createStore({ status: 'ready', groups: GROUPS, current: CURRENT, failures: [], error: null })
   await mac.render(1, { directory })
   const renderSelection = (current) => mac.act(() => {
     directory.setSnapshot({ ...directory.getSnapshot(), current })
@@ -302,7 +309,6 @@ async function main() {
   // The same chord typed into the composer editor, not into the card.
   const editor = mac.window.document.createElement('textarea')
   mac.window.document.body.appendChild(editor)
-  editor.focus()
   await mac.press(MAC, editor)
   check('Cmd+Shift+M closes the card again', mac.panels() === 0, `panels=${mac.panels()}`)
 
@@ -336,12 +342,18 @@ async function main() {
   check('clicking the trigger again closes it', mac.panels() === 0, `panels=${mac.panels()}`)
 
   await mac.press(MAC)
-  const effortRow = mac.window.document.querySelector('.t3mp-effort-row')
-  check('the effort footer is reachable while open', effortRow !== null)
-  await mac.click(effortRow)
-  check('the effort pane opens', mac.window.document.querySelector('.t3mp-pane-head') !== null)
-  await mac.press(MAC)
-  check('the chord closes the card from the effort pane too', mac.panels() === 0, `panels=${mac.panels()}`)
+  const effortRange = mac.window.document.querySelector('[data-t3mp-control="effort"]')
+  check('a Host without session controls still offers native effort', effortRange?.type === 'range'
+    && effortRange.getAttribute('aria-valuetext') === 'Medium' && effortRange.tabIndex === 0)
+  check('the missing endpoint hides the optional controls without an error', mac.window.document.querySelectorAll('[data-t3mp-control]').length === 1
+    && mac.window.document.querySelector('.t3mp-panel [role="alert"]') === null)
+  check('opening fetches the exact active session model', mac.apiCalls.some(call => call.method === 'GET'
+    && new URL(call.url).searchParams.get('sessionId') === 'session-1'
+    && new URL(call.url).searchParams.get('provider') === CURRENT.provider
+    && new URL(call.url).searchParams.get('model') === CURRENT.model))
+  await mac.act(() => { effortRange.focus() })
+  await mac.press(MAC, effortRange)
+  check('the chord closes the card from the effort slider', mac.panels() === 0, `panels=${mac.panels()}`)
 
   await mac.press(MAC)
   await mac.press({ key: 'Escape' }, mac.search())
@@ -372,7 +384,7 @@ async function main() {
   await mac.press(MAC)
   const teamSwitch = () => mac.window.document.querySelector('.t3mp-team-switch')
   check('a model without effort still offers Team in a root session', teamSwitch()?.checked === false
-    && mac.window.document.querySelector('.t3mp-effort-row') === null)
+    && mac.window.document.querySelector('[data-t3mp-control="effort"]') === null)
   await mac.click(teamSwitch())
   check('enabling targets the current session', mac.teamCalls[0]?.sessionId === 'session-1'
     && mac.teamCalls[0]?.enabled === true)
