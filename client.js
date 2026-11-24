@@ -80,6 +80,11 @@ window.__ModuleLoader__.load({
       'contextWindow.row': 'Context window',
       'contextWindow.short': '{count}K',
       'contextWindow.tokens': '{count} tokens',
+      'warning.windowRejected': 'Could not reduce the context window to {target} tokens. Kept {retained} tokens. {reason}',
+      'warning.windowUnavailable': 'This host cannot check the smaller window while the session is running.',
+      'warning.windowMeasurementFailed': 'The host could not measure the model request.',
+      'warning.windowOverBudget': 'The model request does not fit in the smaller window.',
+      'warning.windowUnknown': 'The host could not use the smaller window.',
       'status.controlsLoading': 'Loading session controls…',
       'error.controlsLoad': 'Could not load session controls: {message}',
       'error.controlsSave': 'Could not save session controls: {message}',
@@ -130,6 +135,11 @@ window.__ModuleLoader__.load({
       'contextWindow.row': '上下文窗口',
       'contextWindow.short': '{count}K',
       'contextWindow.tokens': '{count} tokens',
+      'warning.windowRejected': '无法将上下文窗口缩小到 {target} tokens，仍使用 {retained} tokens。{reason}',
+      'warning.windowUnavailable': '当前 Host 无法在会话运行时检查缩小后的窗口。',
+      'warning.windowMeasurementFailed': 'Host 无法估算本次模型请求的用量。',
+      'warning.windowOverBudget': '本次模型请求超出了缩小后的窗口。',
+      'warning.windowUnknown': 'Host 无法使用缩小后的窗口。',
       'status.controlsLoading': '正在加载会话控件…',
       'error.controlsLoad': '会话控件加载失败：{message}',
       'error.controlsSave': '会话设置保存失败：{message}',
@@ -433,20 +443,71 @@ window.__ModuleLoader__.load({
       return record(control) && validOptions(control.options, validate) && control.options.includes(control.value)
     }
 
+    const WINDOW_REFRESH_MS = 1000
+    const WINDOW_REASON_KEYS = new Map([
+      ['unavailable', 'warning.windowUnavailable'],
+      ['measurement-failed', 'warning.windowMeasurementFailed'],
+      ['over-budget', 'warning.windowOverBudget'],
+    ])
+
+    function validTokens(tokens) {
+      return Number.isSafeInteger(tokens) && tokens > 0
+    }
+
+    function validWindowEvent(event) {
+      return record(event) && typeof event.id === 'string' && event.id.length > 0 && validTokens(event.target)
+    }
+
     function validControls(value) {
-      return record(value)
-        && (value.batch === undefined || (value.batch === true && typeof value.revision === 'string'
+      if (!record(value)) return false
+      const { pendingWindow, windowWarning, contextWindow } = value
+      return (value.batch === undefined || (value.batch === true && typeof value.revision === 'string'
           && (value.reasoningEffort === null || validEffort(value.reasoningEffort))))
+        && (value.runningEdits === undefined || (value.runningEdits === true && value.batch === true))
         && (value.speed === undefined || validControl(value.speed, speed => SPEEDS.has(speed)))
-        && (value.contextWindow === undefined || validControl(value.contextWindow, tokens => Number.isSafeInteger(tokens) && tokens > 0))
+        && (contextWindow === undefined || validControl(contextWindow, validTokens))
         && (value.efforts === undefined || validOptions(value.efforts, validEffort))
+        && (pendingWindow === undefined || (value.runningEdits === true && validWindowEvent(pendingWindow)
+          && contextWindow?.options.includes(pendingWindow.target) && pendingWindow.target < contextWindow.value))
+        && (windowWarning === undefined || (value.runningEdits === true && pendingWindow === undefined
+          && validWindowEvent(windowWarning) && typeof windowWarning.reason === 'string'
+          && windowWarning.retained === contextWindow?.value && windowWarning.target < windowWarning.retained))
     }
 
     function controlValue(controls, field) {
       return field === 'reasoningEffort' ? controls?.reasoningEffort : controls?.[field]?.value
     }
 
-    async function requestSessionControls(address, signal, change) {
+    function rejectMatches(result, base, target) {
+      const warning = result?.windowWarning
+      return warning !== undefined && warning.id !== base?.windowWarning?.id
+        && warning.target === target && warning.retained === result.contextWindow?.value
+    }
+
+    function candidateSettled(result, base) {
+      const candidate = base?.pendingWindow
+      return candidate !== undefined && result?.pendingWindow === undefined
+        && (result?.contextWindow?.value === candidate.target
+          || (result?.windowWarning?.id === candidate.id && rejectMatches(result, base, candidate.target)))
+    }
+
+    function rebaseWindowSettlement(base, latest) {
+      if (base.runningEdits === true && latest?.runningEdits === true && candidateSettled(latest, base)
+        && latest.speed?.value === base.speed?.value && latest.reasoningEffort === base.reasoningEffort
+        && ['speed', 'contextWindow', 'efforts'].every((field) => {
+          const options = view => field === 'efforts' ? view.efforts : view[field]?.options
+          return JSON.stringify(options(latest)) === JSON.stringify(options(base))
+        })) return latest
+      return base
+    }
+
+    function confirmsChange(result, base, field, target, allowRunning) {
+      if (field !== 'contextWindow' || !allowRunning) return controlValue(result, field) === target
+      if (result.pendingWindow !== undefined) return result.pendingWindow.target === target
+      return controlValue(result, field) === target || rejectMatches(result, base, target)
+    }
+
+    async function requestSessionControls(address, signal, change, base) {
       // Use the current Host's mount and owner cookie, like Magpie's settings page.
       const url = new URL('api/magpie-session-controls', document.baseURI)
       if (change === undefined) url.search = new URLSearchParams(address).toString()
@@ -476,7 +537,7 @@ window.__ModuleLoader__.load({
       const values = change?.changes ?? (change === undefined ? {} : { [change.field]: change.value })
       if (payload?.ok !== true || !validControls(payload.value)
         || (change?.changes !== undefined && payload.value.batch !== true)
-        || Object.entries(values).some(([field, value]) => controlValue(payload.value, field) !== value)) {
+        || Object.entries(values).some(([field, value]) => !confirmsChange(payload.value, base, field, value, change?.allowRunning))) {
         throw new Error('invalid-session-controls')
       }
       return payload.value
@@ -504,6 +565,7 @@ window.__ModuleLoader__.load({
           return () => { listeners.delete(listener) }
         },
         report: (key, error) => publish({ seq: ++seq, key, error }),
+        reportWindow: (window) => publish({ seq: ++seq, window }),
         dismiss: (current) => { if (notice === current) publish(null) },
       }
     }
@@ -511,22 +573,36 @@ window.__ModuleLoader__.load({
     function PickerNotice({ notices, renderFactorySlot, t }) {
       const notice = useSnapshot(notices)
       if (notice === null) return null
-      const text = t(notice.key, { message: controlErrorMessage(notice.error, t) })
+      const text = notice.window === undefined ? t(notice.key, { message: controlErrorMessage(notice.error, t) })
+        : t('warning.windowRejected', {
+          target: notice.window.target,
+          retained: notice.window.retained,
+          reason: t(WINDOW_REASON_KEYS.get(notice.window.reason) ?? 'warning.windowUnknown'),
+        })
       const onDone = () => notices.dismiss(notice)
       return renderFactorySlot?.('workspace.toast.content', { seq: notice.seq, text, tone: 'warning', onDone })
         ?? h(Toast, { key: notice.seq, text, icon: h(IconWarningOutlineRegular), onDone })
     }
 
-    function createControlOperations(report) {
+    function createControlOperations({ report, reportWindow }) {
       let controller = new AbortController()
       let sessions = new WeakMap()
       let generation = 0
       const active = new Set()
       const listeners = new Set()
+      const seenWarnings = new Set()
       let version = 0
       const publish = () => {
         version += 1
         for (const listener of listeners) listener()
+      }
+      const confirm = (entry, confirmed) => {
+        entry.confirmed = confirmed
+        const warning = confirmed?.windowWarning
+        if (warning !== undefined && !seenWarnings.has(warning.id)) {
+          seenWarnings.add(warning.id)
+          reportWindow(warning)
+        }
       }
 
       const route = (binding, address) => {
@@ -546,10 +622,10 @@ window.__ModuleLoader__.load({
       }
 
       // A refresh that started before a save cannot publish over that save's receipt.
-      const load = (entry) => {
-        if (entry.session.signal.aborted) return
+      const load = (entry, mode) => {
+        if (entry.session.signal.aborted || (mode !== undefined && entry.confirmed?.pendingWindow === undefined)) return
         if (entry.reading || entry.pending.length > 0 || entry.unknown) {
-          entry.refreshRequested = true
+          if (mode !== 'poll') entry.refreshRequested = true
           return
         }
         entry.refreshRequested = false
@@ -557,7 +633,7 @@ window.__ModuleLoader__.load({
         entry.reading = tag
         void requestSessionControls(entry.address, entry.session.signal).then((confirmed) => {
           if (entry.session.signal.aborted || entry.reading !== tag || entry.refreshRequested) return
-          entry.confirmed = confirmed
+          confirm(entry, confirmed)
           entry.loadError = undefined
         }, (error) => {
           if (entry.session.signal.aborted || entry.reading !== tag) return
@@ -577,14 +653,20 @@ window.__ModuleLoader__.load({
         const { signal } = entry.session
         entry.verifying = requestSessionControls(entry.address, signal).then((confirmed) => {
           if (signal.aborted) throw signal.reason
-          if (confirmed === null || (entry.unknown === 'batch' && confirmed.batch !== true)) {
+          const uncertain = entry.unknown
+          if (confirmed === null || (uncertain !== 'legacy' && confirmed.batch !== true)) {
             throw new Error('invalid-session-controls')
           }
-          entry.confirmed = confirmed
+          if (record(uncertain) && confirmsBatch(confirmed, uncertain.verifyBase, uncertain.changes, true)) {
+            uncertain.receipt = confirmed
+          }
+          confirm(entry, confirmed)
           entry.unknown = undefined
           entry.loadError = undefined
           for (const [field, value] of Object.entries(entry.failed)) {
-            if (controlValue(confirmed, field) === value) delete entry.failed[field]
+            const matches = record(uncertain) && uncertain.changes[field] === value
+              ? uncertain.receipt !== undefined : controlValue(confirmed, field) === value
+            if (matches) delete entry.failed[field]
           }
           if (Object.keys(entry.failed).length === 0) entry.failure = undefined
           publish()
@@ -607,11 +689,22 @@ window.__ModuleLoader__.load({
         publish()
       }
 
-      function confirmsBatch(result, base, changes) {
+      function confirmsBatch(result, base, changes, allowRunning = false) {
         if (result?.batch !== true || base?.batch !== true) return false
+        if (allowRunning && (result.runningEdits !== true || result.revision === base.revision)) return false
         const fields = ['speed', 'contextWindow', 'reasoningEffort']
-        return fields.every(field => controlValue(result, field) ===
-          (Object.hasOwn(changes, field) ? changes[field] : controlValue(base, field)))
+        return fields.every((field) => {
+          const changed = Object.hasOwn(changes, field)
+          if (allowRunning && field === 'contextWindow' && base.pendingWindow !== undefined) {
+            const { id, target } = base.pendingWindow
+            if (!changed) {
+              return result.pendingWindow?.id === id || candidateSettled(result, base)
+            }
+            // The prior candidate can resolve on its own while the POST receipt is missing.
+            if (changes[field] === target || (changes[field] === base.contextWindow?.value && result.windowWarning?.id === id)) return false
+          }
+          return confirmsChange(result, base, field, changed ? changes[field] : controlValue(base, field), allowRunning)
+        })
       }
 
       const drain = async (session, cycle) => {
@@ -625,18 +718,25 @@ window.__ModuleLoader__.load({
             await verify(entry)
             if (signal.aborted) return
             if (base?.batch === true) {
-              const expectedRevision = predecessor?.receipt?.revision ?? base.revision
+              // A known candidate resolution can advance the revision while this draft is open.
+              const writeBase = rebaseWindowSettlement(predecessor?.receipt ?? base, entry.confirmed)
+              const { revision: expectedRevision, runningEdits } = writeBase
               try {
-                batch.receipt = await requestSessionControls(entry.address, signal, { changes, expectedRevision })
+                batch.receipt = await requestSessionControls(entry.address, signal, {
+                  changes, expectedRevision, ...(runningEdits && { allowRunning: true }),
+                }, writeBase)
               } catch (error) {
-                if (!error.rejected) {
-                  entry.unknown = 'batch'
-                  batch.verifyBase = predecessor?.receipt ?? base
+                if (error.rejected) throw error
+                batch.verifyBase = writeBase
+                entry.unknown = runningEdits ? batch : 'batch'
+                if (runningEdits) {
+                  // Give a transient verification read one retry before failing a waiting send.
+                  await verify(entry).catch(() => verify(entry)).catch(() => {})
                 }
-                throw error
+                if (batch.receipt === undefined) throw error
               }
               if (signal.aborted) return
-              entry.confirmed = batch.receipt
+              confirm(entry, batch.receipt)
             } else {
               // A legacy Host keeps its independent writes and native effort selection.
               for (const [field, value] of Object.entries(changes)) {
@@ -646,7 +746,8 @@ window.__ModuleLoader__.load({
                   if (result?.ok !== true) throw result?.error ?? new Error('Model selection unavailable')
                 } else {
                   try {
-                    entry.confirmed = await requestSessionControls(entry.address, signal, { field, value })
+                    const receipt = await requestSessionControls(entry.address, signal, { field, value })
+                    if (!signal.aborted) confirm(entry, receipt)
                   } catch (error) {
                     if (!error.rejected) entry.unknown = 'legacy'
                     throw error
@@ -673,10 +774,11 @@ window.__ModuleLoader__.load({
             entry.failure = failure
             report('error.controlsSave', error)
             publish()
-            if (entry.unknown) {
+            if (!entry.unknown) load(entry)
+            else if (!record(entry.unknown)) {
               await verify(entry).catch(() => {})
               if (!entry.unknown && confirmsBatch(entry.confirmed, batch.verifyBase, changes)) batch.receipt = entry.confirmed
-            } else load(entry)
+            }
           } else {
             if (Object.keys(entry.failed).length === 0) entry.failure = undefined
             publish()
@@ -1035,7 +1137,7 @@ window.__ModuleLoader__.load({
         && typeof provider === 'string' && typeof model === 'string'
         ? { sessionId, provider, model }
         : null, [available, sessionId, provider, model])
-      const controlsLocked = locked || running || busy || teamPending
+      const modelActionLocked = locked || running || busy || teamPending
       useSnapshot(controlOperations)
       const binding = getBinding()
       const generation = controlOperations.generation()
@@ -1045,16 +1147,20 @@ window.__ModuleLoader__.load({
       const batchEnabled = canGuard && confirmed?.batch === true
       const pending = entry?.pending ?? []
       const pendingChanges = Object.assign({}, ...pending.map(batch => batch.changes))
+      const pendingWindowId = confirmed?.pendingWindow?.id
       const values = {
         reasoningEffort: batchEnabled ? confirmed.reasoningEffort : current?.reasoningEffort ?? null,
         speed: confirmed?.speed?.value,
-        contextWindow: confirmed?.contextWindow?.value,
+        contextWindow: confirmed?.pendingWindow?.target ?? confirmed?.contextWindow?.value,
         ...pendingChanges,
       }
+      const effectiveWindow = confirmed?.runningEdits === true ? confirmed.contextWindow?.value : values.contextWindow
       const draft = draftRef.current?.entry === entry ? draftRef.current : null
       const editedValues = { ...values, ...draft?.changes }
       const menuControls = draft === null ? confirmed : draft.base
       const menuBatch = canGuard && menuControls?.batch === true
+      const controlsLocked = locked || busy || teamPending || (running && !(menuBatch
+        && confirmed?.runningEdits === true && menuControls.runningEdits === true))
       const { efforts, speed, contextWindow } = menuControls ?? {}
       const loadingControls = entry !== null && confirmed === undefined && entry.loadError === undefined
       const options = useMemo(() => {
@@ -1081,8 +1187,8 @@ window.__ModuleLoader__.load({
       const effortLabel = reasoning === undefined ? undefined : effectiveEffort === undefined
         ? t('effort.providerDefault')
         : reasoning.efforts.find(level => level.id === effectiveEffort)?.name ?? effectiveEffort
-      const windowLabel = values.contextWindow === undefined ? undefined
-        : t('contextWindow.tokens', { count: values.contextWindow })
+      const windowLabel = effectiveWindow === undefined ? undefined
+        : t('contextWindow.tokens', { count: effectiveWindow })
       const speedLabel = values.speed === undefined ? undefined : t(`speed.${values.speed}`)
       const controlLabels = [
         windowLabel && t('trigger.control', { label: t('contextWindow.row'), value: windowLabel }),
@@ -1147,6 +1253,15 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (entry !== null) controlOperations.load(entry)
       }, [entry, catalog.controlsRevision, controlOperations])
+      useEffect(() => {
+        if (entry === null || pendingWindowId === undefined) return
+        if (!running) {
+          controlOperations.load(entry, 'settle')
+          return
+        }
+        const timer = window.setInterval(() => { controlOperations.load(entry, 'poll') }, WINDOW_REFRESH_MS)
+        return () => { window.clearInterval(timer) }
+      }, [entry, pendingWindowId, running, controlOperations])
 
       const show = useCallback(() => {
         openRef.current = true
@@ -1267,7 +1382,7 @@ window.__ModuleLoader__.load({
             close(true)
             return
           }
-          if (controlsLocked || loadingControls) return
+          if (modelActionLocked || loadingControls) return
           if (efforts !== undefined && !efforts.includes(defaultEffort)) {
             defaultEffort = options.effort.find(option => option.value !== null)?.value
           }
@@ -1277,7 +1392,7 @@ window.__ModuleLoader__.load({
           model: row.model.id,
           ...defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort },
         })
-      }, [busy, close, controlsLocked, effectiveEffort, efforts, locked, model, options.effort, provider, loadingControls, submit])
+      }, [busy, close, effectiveEffort, efforts, locked, model, modelActionLocked, options.effort, provider, loadingControls, submit])
 
       // Focus the search field whenever the card opens, mirroring T3.
       useLayoutEffect(() => {
@@ -1694,9 +1809,9 @@ window.__ModuleLoader__.load({
           triggerUnavailable
             ? h('span', { className: 't3mp-badge' }, t('badge.unavailable'))
             : null,
-          values.contextWindow === undefined ? null : h('span', {
-            className: 't3mp-trigger-window', 'data-t3mp-window': values.contextWindow, 'aria-hidden': true,
-          }, values.contextWindow % 1000 === 0 ? t('contextWindow.short', { count: values.contextWindow / 1000 }) : String(values.contextWindow)),
+          effectiveWindow === undefined ? null : h('span', {
+            className: 't3mp-trigger-window', 'data-t3mp-window': effectiveWindow, 'aria-hidden': true,
+          }, effectiveWindow % 1000 === 0 ? t('contextWindow.short', { count: effectiveWindow / 1000 }) : String(effectiveWindow)),
           speedLabel === undefined || values.speed === 'standard' ? null : h(SpeedIcon, { speed: values.speed }),
           h(ChevronDownIcon, { className: open ? 't3mp-chevron t3mp-chevron-open' : 't3mp-chevron' }),
         ),
@@ -2099,7 +2214,7 @@ window.__ModuleLoader__.load({
       const favorites = createFavoritesStore()
       const routable = createRoutableStore(ctx.remote)
       const notices = createNoticeStore()
-      const controlOperations = createControlOperations(notices.report)
+      const controlOperations = createControlOperations(notices)
       let connectionGeneration
       const getBinding = (sessionId) => {
         if (connectionGeneration !== undefined && connectionGeneration.getSnapshot() === undefined) return undefined

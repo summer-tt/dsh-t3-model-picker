@@ -28,7 +28,11 @@ let availability = { speed: true, contextWindow: true }
 let efforts = ['low', 'high']
 let getOverride
 let batch = true
+let runningEdits = false
 let revision = 0
+let windowOutcome
+let dropReceipt
+let nextWindowId = 0
 const defaultControls = { speed: 'fast', contextWindow: 500000 }
 const readControls = (address) => {
   const pref = preferences.get(address) ?? defaultControls
@@ -37,7 +41,22 @@ const readControls = (address) => {
     ...(availability.contextWindow ? { contextWindow: { value: pref.contextWindow, options: [272000, 500000, 872000] } } : {}),
     efforts,
     ...(batch && { batch: true, revision: String(revision), reasoningEffort: pref.reasoningEffort ?? null }),
+    ...(runningEdits && { runningEdits: true }),
+    ...(availability.contextWindow && pref.pendingWindow && { pendingWindow: pref.pendingWindow }),
+    ...(availability.contextWindow && pref.windowWarning && { windowWarning: pref.windowWarning }),
   }
+}
+const settleWindow = (address, reason) => {
+  const pref = preferences.get(address)
+  assert.ok(pref.pendingWindow)
+  const pending = pref.pendingWindow
+  preferences.set(address, {
+    ...pref, pendingWindow: undefined,
+    ...(reason === undefined ? { contextWindow: pending.target } : {
+      windowWarning: { ...pending, retained: pref.contextWindow, reason },
+    }),
+  })
+  revision++
 }
 const deferred = () => {
   let release
@@ -79,14 +98,34 @@ try {
       assert.ok(field === 'reasoningEffort' ? value === null || efforts.includes(value) : readControls(address)[field]?.options.includes(value))
     }
     if (data.changes) assert.equal(data.expectedRevision, String(revision))
+    assert.equal(data.allowRunning, runningEdits ? true : undefined)
     await delays.get(`POST ${address}`)?.promise
     const error = denied.get(address)
     if (error !== undefined) {
       await route.fulfill({ status: 409, json: { ok: false, error } })
       return
     }
-    preferences.set(address, { ...defaultControls, ...preferences.get(address), ...patch })
+    const saved = { ...defaultControls, ...preferences.get(address), ...patch }
+    if (data.allowRunning && Object.hasOwn(patch, 'contextWindow')) {
+      const retained = readControls(address).contextWindow.value
+      saved.pendingWindow = undefined
+      saved.windowWarning = undefined
+      if (patch.contextWindow < retained) {
+        const candidate = { id: String(++nextWindowId), target: patch.contextWindow }
+        saved.contextWindow = retained
+        if (windowOutcome === undefined) saved.pendingWindow = candidate
+        else saved.windowWarning = { ...candidate, retained, reason: windowOutcome }
+      }
+    }
+    preferences.set(address, saved)
     revision++
+    if (dropReceipt) {
+      const onDrop = dropReceipt
+      dropReceipt = undefined
+      onDrop(address)
+      await route.abort()
+      return
+    }
     await route.fulfill({ json: { ok: true, value: readControls(address) } })
   })
   await page.goto(`${mount}session`)
@@ -193,7 +232,7 @@ try {
         if (remount) revision += 1
         if (overlay) overlayRoot.render(h(overlay.component, {
           ...overlay.options.inject?.(), t,
-          renderFactorySlot: (name, props) => h('p', { 'data-notice': name }, props.text),
+          renderFactorySlot: (name, props) => h('button', { 'data-notice': name, onClick: props.onDone }, props.text),
         }))
         root.render(h(seat.component, {
           ...seat.options.inject(sessionId), key: `${sessionId}:${revision}`, locked: false, sessionId,
@@ -356,8 +395,146 @@ try {
   await choose(effort, 'Home')
   await closePicker()
   await page.waitForFunction(() => window.fixture.selectCalls.some(selection => selection.sessionId.endsWith('-lookup-error') && selection.reasoningEffort === 'low'))
+  batch = true
+  getOverride = undefined
+  const legacyRunning = `${sessionB}-legacy-running`
+  await page.evaluate(sessionId => window.fixture.render(sessionId, true), legacyRunning)
+  await reopen()
+  for (const slider of [speed, effort, windowSize]) assert.equal(await slider.getAttribute('aria-disabled'), 'true')
+  await closePicker()
+
+  runningEdits = true
+  const liveSession = `${sessionB}-running-edits`
+  const liveAddress = key(liveSession)
+  const renderRunning = running => page.evaluate(([id, active]) => window.fixture.render(id, active), [liveSession, running])
+  const notice = page.locator('[data-notice="workspace.toast.content"]')
+  await notice.click() // Dismiss the earlier rejected-save fixture's toast.
+  const indicator = trigger.locator('[data-t3mp-window]')
+  const waitWindow = value => page.waitForFunction(size => document.querySelector('[data-t3mp-window]')?.dataset.t3mpWindow === String(size), value)
+  const submitControls = async () => {
+    const request = page.waitForRequest(item => item.method() === 'POST')
+    await closePicker()
+    return (await request).postDataJSON()
+  }
+  // A draft survives the transition from idle to running. The trigger keeps the effective window.
+  await renderRunning(false)
+  await reopen()
+  await choose(speed, 'End')
+  await renderRunning(true)
+  await choose(effort, 'Home')
+  await choose(windowSize, 'Home')
+  const firstRunningWrite = await submitControls()
+  assert.equal(firstRunningWrite.allowRunning, true)
+  assert.deepEqual(firstRunningWrite.changes, { speed: 'ultrafast', reasoningEffort: 'low', contextWindow: 272000 })
+  await waitWindow(500000)
+  await reopen()
+  await waitValue('contextWindow', '272000 tokens')
+  assert.match(await trigger.getAttribute('aria-label'), /Context window 500000 tokens/)
+  await choose(windowSize, 'ArrowRight')
+  const beforeEscape = posts().length
+  await page.keyboard.press('Escape')
+  await panel.waitFor({ state: 'hidden' })
+  assert.equal(posts().length, beforeEscape)
+  await reopen()
+  await waitValue('contextWindow', '272000 tokens')
+  await choose(windowSize, 'ArrowRight')
+  assert.deepEqual((await submitControls()).changes, { contextWindow: 500000 })
+  await reopen()
+  await waitValue('contextWindow', '500000 tokens')
+  assert.equal(preferences.get(liveAddress).pendingWindow, undefined)
+
+  // After a known candidate settles, saving an open draft uses its new revision.
+  await choose(windowSize, 'Home')
+  await submitControls()
+  await reopen()
+  await waitValue('contextWindow', '272000 tokens')
+  await choose(speed, 'Home')
+  settleWindow(liveAddress)
+  await waitWindow(272000)
+  assert.deepEqual((await submitControls()).changes, { speed: 'standard' })
+  await reopen()
+  await waitValue('speed', 'Standard')
+  assert.equal(await notice.count(), 0)
+
+  // Async rejection still uses the notification slot with the picker closed. Idle pauses polling.
+  await choose(windowSize, 'End')
+  await submitControls()
+  await waitWindow(872000)
+  await reopen()
+  await choose(windowSize, 'Home')
+  await submitControls()
+  settleWindow(liveAddress, 'over-budget')
+  await renderRunning(false)
+  await notice.filter({ hasText: /Kept 872000 tokens.*does not fit/ }).waitFor()
+  assert.equal(await indicator.textContent(), '872K')
+  await notice.click()
+  const readsAtIdle = gets(liveAddress).length
+  await page.waitForTimeout(1150)
+  assert.equal(gets(liveAddress).length, readsAtIdle)
+  await reopen()
+  await waitValue('contextWindow', '872000 tokens')
+  assert.equal(await notice.count(), 0)
+  await closePicker()
+
+  // A lost response can be verified as a candidate, or as a rejection with all other fields saved.
+  await renderRunning(true)
+  await reopen()
+  await choose(windowSize, 'Home')
+  dropReceipt = () => {
+    getOverride = () => {
+      getOverride = undefined
+      return { status: 503, json: { ok: false, error: 'Transient verification error' } }
+    }
+  }
+  await page.evaluate(id => window.fixture.send(id), liveSession)
+  assert.equal((await sendOutcome()).ok, true)
+  assert.equal(await indicator.textContent(), '872K')
+  await reopen()
+  await waitValue('contextWindow', '272000 tokens')
+  await choose(windowSize, 'ArrowRight')
+  await choose(speed, 'End')
+  dropReceipt = address => settleWindow(address, 'measurement-failed')
+  await page.evaluate(id => window.fixture.send(id), liveSession)
+  assert.equal((await sendOutcome()).ok, true)
+  await notice.filter({ hasText: /Kept 872000 tokens.*could not measure/ }).waitFor()
+  await notice.click()
+  await reopen()
+  await waitValue('contextWindow', '872000 tokens')
+  await waitValue('speed', 'Ultrafast')
+  assert.equal(await notice.count(), 0)
+
+  // A direct rejection receipt is also a valid partial save, with a localized reason.
+  windowOutcome = 'unavailable'
+  await choose(windowSize, 'Home')
+  await choose(effort, 'End')
+  await submitControls()
+  await notice.filter({ hasText: /Kept 872000 tokens.*cannot check/ }).waitFor()
+  assert.equal(preferences.get(liveAddress).reasoningEffort, null)
+  assert.equal(await indicator.textContent(), '872K')
+  await notice.click()
+
+  // Idle performs one final GET, even if the candidate will need a subsequent turn to settle.
+  windowOutcome = undefined
+  const openRead = page.waitForResponse(response => response.request().method() === 'GET')
+  await reopen()
+  await (await openRead).finished()
+  await choose(windowSize, 'Home')
+  const savedCandidate = page.waitForResponse(response => response.request().method() === 'POST')
+  await submitControls()
+  assert.ok((await (await savedCandidate).json()).value.pendingWindow)
+  const readsBeforeIdle = gets(liveAddress).length
+  const idleRead = page.waitForResponse(response => response.request().method() === 'GET')
+  await renderRunning(false)
+  await idleRead
+  assert.equal(gets(liveAddress).length, readsBeforeIdle + 1)
+  await page.waitForTimeout(1150)
+  assert.equal(gets(liveAddress).length, readsBeforeIdle + 1)
+  settleWindow(liveAddress)
+  await renderRunning(true)
+  await waitWindow(272000)
+  assert.equal(await notice.count(), 0)
   assert.deepEqual(pageErrors, [])
-  console.log(`T3 browser regression passed (${gets(key(sessionA)).length} reads, ${posts().length} writes)`)
+  console.log(`T3 browser regression passed (${calls.length - posts().length} reads, ${posts().length} writes)`)
 } finally {
   await browser.close()
 }
