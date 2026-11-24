@@ -605,13 +605,18 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const route = (binding, address) => {
-        if (binding == null || address === null) return null
+      const sessionFor = (binding) => {
         let session = sessions.get(binding)
         if (session === undefined) {
           session = { routes: new Map(), queue: [], signal: controller.signal }
           sessions.set(binding, session)
         }
+        return session
+      }
+
+      const route = (binding, address) => {
+        if (binding == null || address === null) return null
+        const session = sessionFor(binding)
         const key = JSON.stringify([address.provider, address.model])
         let entry = session.routes.get(key)
         if (entry === undefined) {
@@ -792,6 +797,60 @@ window.__ModuleLoader__.load({
         else cycle.reject(cycle.error)
       }
 
+      const waitForControls = (session, selection, remind) => {
+        if (session.cycle) return session.cycle.promise
+        if (selection == null) return
+        const entry = session.routes.get(JSON.stringify([selection.provider, selection.model]))
+        if (!entry?.unknown) {
+          if (remind && entry?.failure) report('error.controlsSendBlocked', entry.failure.error)
+          return entry?.failure?.promise
+        }
+        return verify(entry).then(() => session.cycle?.promise ?? entry.failure?.promise, (error) => {
+          if (!session.signal.aborted) report('error.controlsSave', error)
+          throw error
+        })
+      }
+
+      const reportModelFailure = (error) => {
+        if (error?.code === 'session/writer-held') report('error.sessionInUse', error)
+        else report('error.action', error?.code && error.name !== 'TimeoutError'
+          ? new Error(`${error.code}: ${error.message}`) : error)
+      }
+
+      const waitForModel = async (directory, target, connectionSignal) => {
+        const signal = AbortSignal.any([connectionSignal, AbortSignal.timeout(10_000)])
+        signal.throwIfAborted()
+        let unsubscribe
+        let abort
+        let graceTimer
+        try {
+          await new Promise((resolve, reject) => {
+            abort = () => reject(signal.reason)
+            signal.addEventListener('abort', abort, { once: true })
+            const confirm = () => {
+              const { current, status, error } = directory.getSnapshot()
+              if (status === 'error') {
+                reject(new Error(error ?? 'Model selection unavailable'))
+              } else if (status !== 'selecting' && current?.provider === target.provider && current.model === target.model) {
+                resolve()
+              } else if (status === 'ready' && current !== null) {
+                // Allow the durable projection to arrive shortly after the RPC receipt.
+                graceTimer ??= setTimeout(() => reject(new Error('Model selection changed')), 250)
+              } else {
+                clearTimeout(graceTimer)
+                graceTimer = undefined
+              }
+            }
+            unsubscribe = directory.subscribe(confirm)
+            confirm()
+          })
+        } finally {
+          clearTimeout(graceTimer)
+          signal.removeEventListener('abort', abort)
+          unsubscribe?.()
+        }
+      }
+
       return {
         route,
         load,
@@ -827,20 +886,43 @@ window.__ModuleLoader__.load({
           }
           publish()
         },
-        wait(binding, selection, remind = false) {
-          const session = sessions.get(binding)
-          if (session === undefined) return
-          if (session.cycle) return session.cycle.promise
-          if (selection == null) return
-          const entry = session.routes.get(JSON.stringify([selection.provider, selection.model]))
-          if (!entry?.unknown) {
-            if (remind && entry?.failure) report('error.controlsSendBlocked', entry.failure.error)
-            return entry?.failure?.promise
-          }
-          return verify(entry).then(() => session.cycle?.promise ?? entry.failure?.promise, (error) => {
-            if (!session.signal.aborted) report('error.controlsSave', error)
-            throw error
+        modelTarget: binding => sessions.get(binding)?.switch?.target,
+        switchModel(binding, directory, selection, select, isCurrent) {
+          const session = sessionFor(binding)
+          if (session.switch) return
+          const { current } = directory.getSnapshot()
+          const switching = { target: selection }
+          // Publish the whole barrier before waiting for any controls saved on close.
+          switching.promise = Promise.resolve().then(async () => {
+            try {
+              await waitForControls(session, current, true)
+              session.signal.throwIfAborted()
+              const latest = directory.getSnapshot().current
+              if (!isCurrent() || latest?.provider !== current?.provider || latest?.model !== current?.model) {
+                throw new Error('Model selection changed')
+              }
+              try {
+                const result = await select(selection)
+                if (result?.ok !== true) throw result?.error ?? new Error('Model selection unavailable')
+                await waitForModel(directory, selection, session.signal)
+              } catch (error) {
+                if (!session.signal.aborted) reportModelFailure(error)
+                throw error
+              }
+            } finally {
+              session.switch = undefined
+              if (!session.signal.aborted) publish()
+            }
           })
+          void switching.promise.catch(() => {})
+          session.switch = switching
+          publish()
+        },
+        wait(binding, directory, remind = false) {
+          if (binding == null) return
+          const session = sessionFor(binding)
+          if (session.switch) return session.switch.promise
+          return waitForControls(session, directory.getSnapshot().current, remind)
         },
         reset() {
           controller.abort(new Error('Session connection changed'))
@@ -1038,8 +1120,12 @@ window.__ModuleLoader__.load({
       const waitRef = useRef(null)
       const [, redrawDraft] = useState(0)
 
+      useSnapshot(controlOperations)
+      const binding = getBinding()
+      const pendingTarget = controlOperations.modelTarget(binding)
       const groups = state.groups
       const current = state.current
+      const displaySelection = pendingTarget ?? current
       const favoriteKeys = useMemo(
         () => new Set(favoriteList.map(entry => `${entry.provider}\u0000${entry.model}`)),
         [favoriteList],
@@ -1069,10 +1155,11 @@ window.__ModuleLoader__.load({
       }, [groups, favoriteKeys, routableKnown, routableSet])
 
       const rowByKey = useMemo(() => new Map(allRows.map(row => [row.key, row])), [allRows])
-      const currentRow = current === null
+      const currentRow = displaySelection === null
         ? undefined
-        : rowByKey.get(`${current.provider}\u0000${current.model}`)
-      const reasoning = currentRow?.model.reasoning
+        : rowByKey.get(`${displaySelection.provider}\u0000${displaySelection.model}`)
+      const reasoning = current === null ? undefined
+        : rowByKey.get(`${current.provider}\u0000${current.model}`)?.model.reasoning
 
       /** The provider list the rail renders, in catalog order. */
       const providers = useMemo(
@@ -1130,7 +1217,8 @@ window.__ModuleLoader__.load({
       const jumpLabels = useMemo(() => new Map(visibleRows.slice(0, JUMP_COUNT)
         .map((row, index) => [row.key, jumpLabel(index)])), [visibleRows])
 
-      const busy = state.pending != null || state.status === 'selecting'
+      const busy = pendingTarget !== undefined
+      const controlsBusy = busy || state.pending != null || state.status === 'selecting'
       const provider = current?.provider
       const model = current?.model
       const address = useMemo(() => available && typeof sessionId === 'string' && sessionId.length > 0
@@ -1138,8 +1226,6 @@ window.__ModuleLoader__.load({
         ? { sessionId, provider, model }
         : null, [available, sessionId, provider, model])
       const modelActionLocked = locked || running || busy || teamPending
-      useSnapshot(controlOperations)
-      const binding = getBinding()
       const generation = controlOperations.generation()
       const entry = controlOperations.route(binding, address)
       const confirmed = entry?.confirmed
@@ -1159,7 +1245,7 @@ window.__ModuleLoader__.load({
       const editedValues = { ...values, ...draft?.changes }
       const menuControls = draft === null ? confirmed : draft.base
       const menuBatch = canGuard && menuControls?.batch === true
-      const controlsLocked = locked || busy || teamPending || (running && !(menuBatch
+      const controlsLocked = locked || controlsBusy || teamPending || (running && !(menuBatch
         && confirmed?.runningEdits === true && menuControls.runningEdits === true))
       const { efforts, speed, contextWindow } = menuControls ?? {}
       const loadingControls = entry !== null && confirmed === undefined && entry.loadError === undefined
@@ -1194,22 +1280,22 @@ window.__ModuleLoader__.load({
         windowLabel && t('trigger.control', { label: t('contextWindow.row'), value: windowLabel }),
         speedLabel && t('trigger.control', { label: t('speed.row'), value: speedLabel }),
       ].filter(Boolean)
-      const waiting = current === null && state.status === 'loading'
+      const waiting = displaySelection === null && state.status === 'loading'
 
       const modelLabel = waiting
         ? t('trigger.loading')
         : currentRow?.model.name
-          ?? (current === null ? t('trigger.fallback') : `${current.provider}/${current.model}`)
+          ?? (displaySelection === null ? t('trigger.fallback') : `${displaySelection.provider}/${displaySelection.model}`)
       const triggerLabel = effortLabel === undefined ? modelLabel : `${modelLabel} · ${effortLabel}`
       const triggerAria = waiting
         ? t('trigger.loading')
-        : current === null
+        : displaySelection === null
           ? t('trigger.fallback')
           : effortLabel === undefined
             ? t('trigger.aria', { model: modelLabel })
             : t('trigger.ariaEffort', { model: modelLabel, effort: effortLabel })
       const triggerUnavailable = currentRow?.unavailable === true
-        || (current !== null && routableKnown && !routableSet.has(current.provider))
+        || (displaySelection !== null && routableKnown && !routableSet.has(displaySelection.provider))
 
       const reload = useCallback(() => {
         lastActionRef.current = 'load'
@@ -1236,7 +1322,7 @@ window.__ModuleLoader__.load({
 
       useLayoutEffect(() => {
         closeRef.current = close
-        waitRef.current = () => controlOperations.wait(binding, directory.getSnapshot().current, true)
+        waitRef.current = () => controlOperations.wait(binding, directory, true)
       }, [binding, close, controlOperations, directory])
       useLayoutEffect(() => {
         const unregister = !available || binding == null ? undefined
@@ -1266,14 +1352,14 @@ window.__ModuleLoader__.load({
       const show = useCallback(() => {
         openRef.current = true
         triggerRef.current?.focus()
-        setPane(favoriteList.length > 0 ? 'favorites' : (current?.provider ?? 'favorites'))
+        setPane(favoriteList.length > 0 ? 'favorites' : (displaySelection?.provider ?? 'favorites'))
         setQuery('')
         setHighlight(0)
         setOpen(true)
         reload()
         routable.load()
         if (entry !== null) controlOperations.load(entry)
-      }, [controlOperations, current, entry, favoriteList.length, reload, routable])
+      }, [controlOperations, displaySelection, entry, favoriteList.length, reload, routable])
 
       /** What the trigger click and the toggle chord both do. */
       const toggle = useCallback(() => {
@@ -1308,7 +1394,7 @@ window.__ModuleLoader__.load({
         setToast({ seq: ++toastSeq.current, text })
       }, [])
 
-      const teamLocked = locked || busy || teamPending || pending.length > 0 || modelSelection === undefined
+      const teamLocked = locked || controlsBusy || teamPending || pending.length > 0 || modelSelection === undefined
       const confirmDisable = disableRequest?.sessionId === sessionId
       const saveTeam = async (enabled, onFailure) => {
         if (teamLocked || setTeamEnabled === undefined) return false
@@ -1348,34 +1434,15 @@ window.__ModuleLoader__.load({
         if (!teamPending) setDisableRequest(null)
       }
 
-      const choosingModel = useRef(false)
-      const submit = useCallback(async (selection) => {
-        choosingModel.current = true
+      const submit = useCallback((selection) => {
+        if (binding == null || getBinding() !== binding) return
         close(true)
-        try {
-          try {
-            await controlOperations.wait(binding, { provider, model })
-          } catch {
-            return
-          }
-          // A route or binding change can invalidate the selection while waiting.
-          const latest = directory.getSnapshot().current
-          if (getBinding() !== binding || entry?.session.signal.aborted
-            || latest?.provider !== provider || latest?.model !== model) return
-          lastActionRef.current = 'select'
-          const result = await select(selection)
-          if (result?.ok === false) throw result.error
-        } catch (error) {
-          reportFailure(error?.code === 'session/writer-held'
-            ? t('error.sessionInUse')
-            : t('error.action', { message: error?.code ? `${error.code}: ${error.message}` : controlErrorMessage(error, t) }))
-        } finally {
-          choosingModel.current = false
-        }
-      }, [binding, close, controlOperations, directory, entry, getBinding, model, provider, reportFailure, select, t])
+        lastActionRef.current = 'select'
+        controlOperations.switchModel(binding, directory, selection, select, () => getBinding() === binding)
+      }, [binding, close, controlOperations, directory, getBinding, select])
 
       const chooseModel = useCallback((row) => {
-        if (locked || busy || choosingModel.current) return
+        if (locked || busy) return
         let defaultEffort = row.model.reasoning?.defaultEffort
         if (provider === row.provider && model === row.model.id) {
           if (effectiveEffort === undefined || options.effort.some(option => option.value === effectiveEffort)) {
@@ -1438,7 +1505,7 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!open) return
         const onKeyDown = (event) => {
-          if (locked || busy || choosingModel.current) return
+          if (locked || busy) return
           const index = jumpIndexFromEvent(event)
           if (index === null) return
           const row = visibleRows[index]
@@ -1566,9 +1633,9 @@ window.__ModuleLoader__.load({
 
       const renderModelRow = (row, index) => {
         const isFavorite = favoriteKeys.has(row.key)
-        const isSelected = current !== null
-          && current.provider === row.provider
-          && current.model === row.model.id
+        const isSelected = displaySelection !== null
+          && displaySelection.provider === row.provider
+          && displaySelection.model === row.model.id
         const label = jumpLabels.get(row.key)
         const disabled = locked || busy
           || (row.unavailable && provider !== row.provider)
@@ -1799,8 +1866,8 @@ window.__ModuleLoader__.load({
           disabled: locked,
           onClick: toggle,
         },
-          current !== null
-            ? h(ProviderLogo, { providerId: current.provider, className: 't3mp-trigger-glyph' })
+          displaySelection !== null
+            ? h(ProviderLogo, { providerId: displaySelection.provider, className: 't3mp-trigger-glyph' })
             : h(ChevronDownIcon, { className: 't3mp-trigger-fallback' }),
           h('span', { className: 't3mp-trigger-label' }, modelLabel),
           effortLabel === undefined

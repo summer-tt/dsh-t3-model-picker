@@ -33,6 +33,10 @@ let revision = 0
 let windowOutcome
 let dropReceipt
 let nextWindowId = 0
+// Model-switch gate: how long a stubbed selectModel stays in flight (0 settles
+// on the next tick), and the transport timeout (Infinity disables it).
+let selectDelay = 0
+let selectTimeout = Infinity
 const defaultControls = { speed: 'fast', contextWindow: 500000 }
 const readControls = (address) => {
   const pref = preferences.get(address) ?? defaultControls
@@ -141,6 +145,11 @@ try {
     const sends = []
     const abandons = []
     let requestSequence = 0
+    // Model-switch fixtures: one deferred selectModel per call, so a test can
+    // hold a switch "in flight" and decide when it settles.
+    const selects = []
+    let selectDelay = 0
+    let selectTimeout = Infinity
     function binding(sessionId) {
       if (!bindings.has(sessionId)) bindings.set(sessionId, { sessionId, session: {
         beginSubmission() {
@@ -182,12 +191,35 @@ try {
         },
         async select(selection) {
           selectCalls.push({ sessionId, ...selection })
+          // Mirror the real ModelDirectory: mark selecting+pending synchronously,
+          // then settle to ready/current or error. The switch is deferred so a
+          // test can observe the picker before it settles.
+          const record = { sessionId, ...selection }
+          record.promise = new Promise((resolve) => { record.release = resolve })
+          selects.push(record)
+          state = { ...state, status: 'selecting', pending: selection }
+          publish()
+          if (typeof selectDelay === 'number' && Number.isFinite(selectDelay)) setTimeout(() => record.release(), selectDelay)
+          if (selectTimeout !== Infinity) {
+            const timer = new Promise((_, reject) => setTimeout(() => reject(Object.assign(
+              new Error('Request timed out'), { name: 'TimeoutError' },
+            )), selectTimeout))
+            try {
+              await Promise.race([record.promise, timer])
+            } catch (error) {
+              state = { ...state, status: 'error', pending: null, error: error.message }
+              publish()
+              throw error
+            }
+          } else {
+            await record.promise
+          }
           if (selectError !== undefined) {
-            state = { ...state, status: 'error', error: selectError }
+            state = { ...state, status: 'error', pending: null, error: selectError }
             publish()
             return { ok: false, error: { code: 'test/rejected', message: selectError } }
           }
-          state = { ...state, status: 'ready', error: null, current: selection }
+          state = { ...state, status: 'ready', pending: null, error: null, current: selection }
           publish()
           return { ok: true }
         },
@@ -246,6 +278,19 @@ try {
       refresh() { handlers.get('settings/document-updated')() },
       failSelect(message) { selectError = message },
       selectCalls,
+      selects,
+      // Hold the next selectModel in flight for `ms`, or Infinity to wait for releaseSelect().
+      delaySelect(ms) { selectDelay = ms },
+      // Give the transport a `ms` timeout (or Infinity to disable it).
+      setSelectTimeout(ms) { selectTimeout = ms },
+      releaseSelect(sessionId, modelId) {
+        const record = selects.findLast(item => !item.released
+          && (sessionId === undefined || item.sessionId === sessionId)
+          && (modelId === undefined || item.model === modelId))
+        if (!record) throw new Error('releaseSelect: no in-flight selectModel')
+        record.released = true
+        record.release()
+      },
     }
   }, { provider, model, otherModel })
   await page.addScriptTag({ path: fileURLToPath(new URL('../client.js', import.meta.url)) })
@@ -533,6 +578,108 @@ try {
   await renderRunning(true)
   await waitWindow(272000)
   assert.equal(await notice.count(), 0)
+
+  // ── Optimistic model switch ────────────────────────────────────────────────
+  // The composer trigger is the chat box's model label: it must show the newly
+  // chosen model as soon as the row is clicked, before selectModel settles, and
+  // no request may leave while the switch is still in flight. A failed or
+  // timed-out switch rolls the label back and notifies, then sending recovers.
+  const switchSession = `${sessionB}-optimistic-switch`
+  const renderSwitch = running => page.evaluate(([id, active]) => window.fixture.render(id, active), [switchSession, running])
+  const triggerLabel = () => page.locator('.t3mp-trigger .t3mp-trigger-label')
+  const rowFor = name => panel.locator('.t3mp-row').filter({ hasText: name })
+  const sendSwitch = () => page.evaluate(id => window.fixture.send(id), switchSession)
+  const sendOk = () => page.evaluate(() => window.lastSend.then(value => value.ok))
+  const switchCounts = () => page.evaluate(() => [window.fixture.sends.length, window.fixture.abandons.length])
+  const resetCounters = () => page.evaluate(() => {
+    window.fixture.selects.length = 0; window.fixture.sends.length = 0; window.fixture.abandons.length = 0
+  })
+  const pendingSelect = () => page.evaluate(() => {
+    const list = window.fixture.selects
+    if (list.length === 0) return null
+    const { promise, release, released, ...rest } = list[list.length - 1]
+    return rest
+  })
+  const waitSelect = count => page.waitForFunction(n => window.fixture.selects.length >= n, count)
+  const waitLabel = value => page.waitForFunction(text =>
+    document.querySelector('.t3mp-trigger .t3mp-trigger-label')?.textContent === text, value)
+  const clearNotices = async () => { while (await notice.count()) await notice.first().click() }
+  const pick = async name => {
+    await trigger.click()
+    await panel.waitFor()
+    await rowFor(name).first().click()
+    await panel.waitFor({ state: 'hidden' })
+  }
+  try {
+    await renderSwitch(false)
+    await triggerLabel().waitFor()
+    assert.equal(await triggerLabel().textContent(), model)
+    await resetCounters()
+    const targetReadsStart = gets(key(switchSession, otherModel)).length
+
+    // 1) The label switches immediately while the switch is still in flight, and
+    //    the confirmed model's controls are not re-fetched for the target.
+    await page.evaluate(() => window.fixture.delaySelect(Infinity))
+    await pick(otherModel)
+    await waitLabel(otherModel)
+    await waitSelect(1)
+    assert.deepEqual(await pendingSelect(), { sessionId: switchSession, provider, model: otherModel, reasoningEffort: 'medium' })
+    assert.equal(gets(key(switchSession, otherModel)).length, targetReadsStart,
+      'the picker must not load the target model controls before the switch confirms')
+
+    // 2) No request is sent while the switch has not confirmed.
+    await sendSwitch()
+    await page.waitForTimeout(50)
+    assert.deepEqual(await switchCounts(), [0, 0])
+
+    // 3) Confirming the switch lets the queued request go, still showing the new model.
+    await page.evaluate(() => window.fixture.releaseSelect())
+    assert.equal(await sendOk(), true)
+    assert.deepEqual(await switchCounts(), [1, 0])
+    assert.equal(await triggerLabel().textContent(), otherModel)
+
+    // 4) A failing switch abandons the in-flight request, rolls the label back and
+    //    notifies; a later request recovers instead of staying blocked forever.
+    await clearNotices()
+    await resetCounters()
+    await page.evaluate(() => window.fixture.failSelect('switch rejected'))
+    await pick(model)
+    await waitLabel(model)
+    await waitSelect(1)
+    await sendSwitch()
+    await page.waitForTimeout(50)
+    assert.deepEqual(await switchCounts(), [0, 0])
+    await page.evaluate(() => window.fixture.releaseSelect())
+    assert.equal(await sendOk(), false)
+    assert.deepEqual(await switchCounts(), [0, 1])
+    await notice.filter({ hasText: /switch rejected/ }).waitFor()
+    assert.equal(await triggerLabel().textContent(), otherModel)
+    await page.evaluate(() => window.fixture.failSelect(undefined))
+    await sendSwitch()
+    assert.equal(await sendOk(), true)
+    assert.equal((await switchCounts())[0], 1)
+
+    // 5) A switch that times out rolls the label back and notifies, and sending
+    //    recovers afterwards.
+    await clearNotices()
+    await resetCounters()
+    await page.evaluate(() => { window.fixture.delaySelect(Infinity); window.fixture.setSelectTimeout(150) })
+    await pick(model)
+    await waitLabel(model)
+    await notice.filter({ hasText: /Request timed out/ }).waitFor()
+    assert.equal(await triggerLabel().textContent(), otherModel)
+    await sendSwitch()
+    assert.equal(await sendOk(), true)
+    assert.equal((await switchCounts())[0], 1)
+    await clearNotices()
+  } finally {
+    await page.evaluate(() => {
+      window.fixture.failSelect(undefined)
+      window.fixture.delaySelect(undefined)
+      window.fixture.setSelectTimeout(10000)
+    })
+  }
+
   assert.deepEqual(pageErrors, [])
   console.log(`T3 browser regression passed (${calls.length - posts().length} reads, ${posts().length} writes)`)
 } finally {
