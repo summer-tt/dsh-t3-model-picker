@@ -85,6 +85,7 @@ window.__ModuleLoader__.load({
       'warning.windowMeasurementFailed': 'The host could not measure the model request.',
       'warning.windowOverBudget': 'The model request does not fit in the smaller window.',
       'warning.windowUnknown': 'The host could not use the smaller window.',
+      'status.switchingModel': 'Switching model…',
       'status.controlsLoading': 'Loading session controls…',
       'error.controlsLoad': 'Could not load session controls: {message}',
       'error.controlsSave': 'Could not save session controls: {message}',
@@ -140,6 +141,7 @@ window.__ModuleLoader__.load({
       'warning.windowMeasurementFailed': 'Host 无法估算本次模型请求的用量。',
       'warning.windowOverBudget': '本次模型请求超出了缩小后的窗口。',
       'warning.windowUnknown': 'Host 无法使用缩小后的窗口。',
+      'status.switchingModel': '正在切换模型…',
       'status.controlsLoading': '正在加载会话控件…',
       'error.controlsLoad': '会话控件加载失败：{message}',
       'error.controlsSave': '会话设置保存失败：{message}',
@@ -1225,7 +1227,6 @@ window.__ModuleLoader__.load({
         && typeof provider === 'string' && typeof model === 'string'
         ? { sessionId, provider, model }
         : null, [available, sessionId, provider, model])
-      const modelActionLocked = locked || running || busy || teamPending
       const generation = controlOperations.generation()
       const entry = controlOperations.route(binding, address)
       const confirmed = entry?.confirmed
@@ -1273,9 +1274,9 @@ window.__ModuleLoader__.load({
       const effortLabel = reasoning === undefined ? undefined : effectiveEffort === undefined
         ? t('effort.providerDefault')
         : reasoning.efforts.find(level => level.id === effectiveEffort)?.name ?? effectiveEffort
-      const windowLabel = effectiveWindow === undefined ? undefined
+      const windowLabel = busy || effectiveWindow === undefined ? undefined
         : t('contextWindow.tokens', { count: effectiveWindow })
-      const speedLabel = values.speed === undefined ? undefined : t(`speed.${values.speed}`)
+      const speedLabel = busy || values.speed === undefined ? undefined : t(`speed.${values.speed}`)
       const controlLabels = [
         windowLabel && t('trigger.control', { label: t('contextWindow.row'), value: windowLabel }),
         speedLabel && t('trigger.control', { label: t('speed.row'), value: speedLabel }),
@@ -1286,14 +1287,15 @@ window.__ModuleLoader__.load({
         ? t('trigger.loading')
         : currentRow?.model.name
           ?? (displaySelection === null ? t('trigger.fallback') : `${displaySelection.provider}/${displaySelection.model}`)
-      const triggerLabel = effortLabel === undefined ? modelLabel : `${modelLabel} · ${effortLabel}`
+      const triggerEffort = busy ? undefined : effortLabel
+      const triggerLabel = triggerEffort === undefined ? modelLabel : `${modelLabel} · ${triggerEffort}`
       const triggerAria = waiting
         ? t('trigger.loading')
         : displaySelection === null
           ? t('trigger.fallback')
-          : effortLabel === undefined
+          : triggerEffort === undefined
             ? t('trigger.aria', { model: modelLabel })
-            : t('trigger.ariaEffort', { model: modelLabel, effort: effortLabel })
+            : t('trigger.ariaEffort', { model: modelLabel, effort: triggerEffort })
       const triggerUnavailable = currentRow?.unavailable === true
         || (displaySelection !== null && routableKnown && !routableSet.has(displaySelection.provider))
 
@@ -1302,23 +1304,27 @@ window.__ModuleLoader__.load({
         load()
       }, [load])
 
-      // Keep a synchronous draft for outside mousedown, blur, and beginSubmission.
+      const saveDraft = useCallback(() => {
+        const draft = draftRef.current
+        draftRef.current = null
+        const latest = directory.getSnapshot().current
+        if (draft !== null && draft.entry === entry && Object.keys(draft.changes).length > 0
+          && getBinding() === binding && latest?.provider === entry.address.provider && latest?.model === entry.address.model) {
+          controlOperations.commit(entry, draft.changes, draft.base, draft.predecessor, select)
+        }
+      }, [binding, controlOperations, directory, entry, getBinding, select])
+
       const close = useCallback((restoreFocus, cancel = false) => {
         if (!openRef.current) return
         openRef.current = false
-        const closing = draftRef.current
-        draftRef.current = null
-        const latest = directory.getSnapshot().current
-        if (!cancel && closing !== null && closing.entry === entry && Object.keys(closing.changes).length > 0
-          && getBinding() === binding && latest?.provider === entry.address.provider && latest?.model === entry.address.model) {
-          controlOperations.commit(entry, closing.changes, closing.base, closing.predecessor, select)
-        }
+        if (cancel) draftRef.current = null
+        else saveDraft()
         setOpen(false)
         setPane('favorites')
         setQuery('')
         setHighlight(0)
         if (restoreFocus === true) queueMicrotask(() => { triggerRef.current?.focus() })
-      }, [binding, controlOperations, directory, entry, getBinding, select])
+      }, [saveDraft])
 
       useLayoutEffect(() => {
         closeRef.current = close
@@ -1434,32 +1440,24 @@ window.__ModuleLoader__.load({
         if (!teamPending) setDisableRequest(null)
       }
 
-      const submit = useCallback((selection) => {
-        if (binding == null || getBinding() !== binding) return
-        close(true)
-        lastActionRef.current = 'select'
-        controlOperations.switchModel(binding, directory, selection, select, () => getBinding() === binding)
-      }, [binding, close, controlOperations, directory, getBinding, select])
-
       const chooseModel = useCallback((row) => {
-        if (locked || busy) return
-        let defaultEffort = row.model.reasoning?.defaultEffort
-        if (provider === row.provider && model === row.model.id) {
-          if (effectiveEffort === undefined || options.effort.some(option => option.value === effectiveEffort)) {
-            close(true)
-            return
-          }
-          if (modelActionLocked || loadingControls) return
-          if (efforts !== undefined && !efforts.includes(defaultEffort)) {
-            defaultEffort = options.effort.find(option => option.value !== null)?.value
-          }
+        if (locked) return
+        if (displaySelection?.provider === row.provider && displaySelection.model === row.model.id) {
+          close(true)
+          return
         }
-        void submit({
+        if (busy || binding == null || getBinding() !== binding) return
+        const defaultEffort = row.model.reasoning?.defaultEffort
+        saveDraft()
+        // The active row or slider may disappear or become disabled during selection.
+        searchRef.current?.focus({ preventScroll: true })
+        lastActionRef.current = 'select'
+        controlOperations.switchModel(binding, directory, {
           provider: row.provider,
           model: row.model.id,
           ...defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort },
-        })
-      }, [busy, close, effectiveEffort, efforts, locked, model, modelActionLocked, options.effort, provider, loadingControls, submit])
+        }, select, () => getBinding() === binding)
+      }, [binding, busy, close, controlOperations, directory, displaySelection, getBinding, locked, saveDraft, select])
 
       // Focus the search field whenever the card opens, mirroring T3.
       useLayoutEffect(() => {
@@ -1491,20 +1489,26 @@ window.__ModuleLoader__.load({
       // Outside press closes the card.
       useEffect(() => {
         if (!open) return
-        const onMouseDown = (event) => {
+        const onPointerDown = (event) => {
           if (rootRef.current?.contains(event.target) === true) return
           if (panelRef.current?.contains(event.target) === true) return
           close(false)
         }
-        document.addEventListener('mousedown', onMouseDown)
-        return () => { document.removeEventListener('mousedown', onMouseDown) }
+        document.addEventListener('pointerdown', onPointerDown, true)
+        return () => { document.removeEventListener('pointerdown', onPointerDown, true) }
       }, [close, open])
 
-      // Jump chords stay document-wide so a keystroke works while the composer
-      // editor or a row holds focus.
+      // Escape and jump chords work even when focus has moved outside the picker.
       useEffect(() => {
         if (!open) return
         const onKeyDown = (event) => {
+          if (!openRef.current || event.isComposing) return
+          if (event.key === 'Escape') {
+            event.preventDefault()
+            event.stopPropagation()
+            close(true, true)
+            return
+          }
           if (locked || busy) return
           const index = jumpIndexFromEvent(event)
           if (index === null) return
@@ -1516,7 +1520,7 @@ window.__ModuleLoader__.load({
         }
         window.addEventListener('keydown', onKeyDown, true)
         return () => { window.removeEventListener('keydown', onKeyDown, true) }
-      }, [chooseModel, locked, busy, provider, open, visibleRows])
+      }, [chooseModel, close, locked, busy, provider, open, visibleRows])
 
       // Lend this seat to the document-wide toggle chord. The handle reads the
       // live DOM and the current props, so it is never stale between the
@@ -1565,12 +1569,6 @@ window.__ModuleLoader__.load({
       }
 
       const onPanelKeyDown = (event) => {
-        if (event.key === 'Escape') {
-          event.preventDefault()
-          event.stopPropagation()
-          close(true, true)
-          return
-        }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
           const active = document.activeElement
           if (active instanceof HTMLButtonElement && active.dataset.t3mpRow !== undefined) {
@@ -1593,14 +1591,6 @@ window.__ModuleLoader__.load({
             if (row !== undefined && (!row.unavailable || row.provider === provider)) chooseModel(row)
           }
         }
-      }
-
-      const onPanelBlur = (event) => {
-        if (event.relatedTarget instanceof Node && (
-          rootRef.current?.contains(event.relatedTarget) === true
-          || panelRef.current?.contains(event.relatedTarget) === true
-        )) return
-        close(false)
       }
 
       const railSelect = (id) => {
@@ -1637,8 +1627,8 @@ window.__ModuleLoader__.load({
           && displaySelection.provider === row.provider
           && displaySelection.model === row.model.id
         const label = jumpLabels.get(row.key)
-        const disabled = locked || busy
-          || (row.unavailable && provider !== row.provider)
+        const disabled = locked || (busy && !isSelected)
+          || (row.unavailable && provider !== row.provider && !isSelected)
         return h('button', {
           key: row.key,
           ref: (node) => { rowRefs.current[index] = node },
@@ -1792,7 +1782,9 @@ window.__ModuleLoader__.load({
         })
       })
       let controlsFeedback = null
-      if (entry?.loadError !== undefined) {
+      if (busy) {
+        controlsFeedback = h('div', { className: 't3mp-status', role: 'status' }, t('status.switchingModel'))
+      } else if (entry?.loadError !== undefined) {
         controlsFeedback = h('div', { className: 't3mp-error', role: 'alert' },
           h('span', null, t('error.controlsLoad', { message: controlErrorMessage(entry.loadError, t) })),
           h('button', {
@@ -1823,7 +1815,6 @@ window.__ModuleLoader__.load({
         role: 'dialog',
         'aria-label': t('panel.aria'),
         onKeyDown: onPanelKeyDown,
-        onBlur: onPanelBlur,
       },
         rail,
         h('div', { className: rail === null ? 't3mp-main t3mp-main-full' : 't3mp-main' },
@@ -1832,8 +1823,8 @@ window.__ModuleLoader__.load({
           h('div', { className: 't3mp-list scrollable' }, resultNodes),
           empty ? h('div', { className: 't3mp-empty' }, t('empty.models')) : null,
           controlsFeedback,
-          saveFeedback,
-          controlRows,
+          busy ? null : saveFeedback,
+          busy ? null : controlRows,
           open && !addressedChild && !listedChild && teamMode !== undefined && setTeamEnabled !== undefined
             ? h('label', { className: 't3mp-team-row' },
               t('team.label'),
@@ -1850,7 +1841,6 @@ window.__ModuleLoader__.load({
       return h(React.Fragment, null, h('div', {
         ref: rootRef,
         className: 't3mp-root',
-        onBlur: onPanelBlur,
         onMouseDown: (event) => {
           if (event.target instanceof Element && event.target.closest('button') !== null) event.preventDefault()
         },
@@ -1870,13 +1860,13 @@ window.__ModuleLoader__.load({
             ? h(ProviderLogo, { providerId: displaySelection.provider, className: 't3mp-trigger-glyph' })
             : h(ChevronDownIcon, { className: 't3mp-trigger-fallback' }),
           h('span', { className: 't3mp-trigger-label' }, modelLabel),
-          effortLabel === undefined
+          triggerEffort === undefined
             ? null
-            : h('span', { className: 't3mp-trigger-effort' }, effortLabel),
+            : h('span', { className: 't3mp-trigger-effort' }, triggerEffort),
           triggerUnavailable
             ? h('span', { className: 't3mp-badge' }, t('badge.unavailable'))
             : null,
-          effectiveWindow === undefined ? null : h('span', {
+          windowLabel === undefined ? null : h('span', {
             className: 't3mp-trigger-window', 'data-t3mp-window': effectiveWindow, 'aria-hidden': true,
           }, effectiveWindow % 1000 === 0 ? t('contextWindow.short', { count: effectiveWindow / 1000 }) : String(effectiveWindow)),
           speedLabel === undefined || values.speed === 'standard' ? null : h(SpeedIcon, { speed: values.speed }),
