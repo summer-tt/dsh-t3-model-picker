@@ -30,9 +30,8 @@ Harness's model directory. Please support the original project.
   provider name, including subsequence matching for queries of three characters
   or more, with a small boost for favorites. Results are grouped under provider
   headings.
-- **Favorites.** A star on every row, stored in the browser under
-  `dsh.t3-model-picker.favorites.v1` as `[{ provider, model }]`. The Favorites
-  rail entry lists them grouped by provider.
+- **Favorites.** Stars are saved in `t3-model-picker.favorites` in the DSH Web profile. Browsers connected to that profile share the list. Each entry stores the model and provider IDs and the remote server ID, with `null` for the local Host.
+- **Browser favorites import.** Reload the upgraded DSH page from the browser and address where you saved favorites. T3 merges them into the profile when the plugin loads, then clears the browser copy after DSH confirms it. Legacy favorites were shared by all DSH pages on the same browser origin. If several deployments share an origin, open the intended destination first.
 - **Jump shortcuts.** `Cmd`+`1`…`9` on macOS, `Ctrl`+`1`…`9` elsewhere, select
   the first nine rows of the visible list; each of those rows shows its chord in
   a `kbd` chip. The listener is live only while the card is open.

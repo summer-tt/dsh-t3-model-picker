@@ -232,7 +232,10 @@ try {
       locale: { register: (_, values) => { dictionary = values.en } },
       effect: fn => fn(),
       on: (name, handler) => handlers.set(name, handler),
-      inject: (_, setup) => setup({ effect: fn => fn(), remote: { agentTeams: {} } }),
+      inject: (keys, setup) => {
+        if (keys.includes('remote.settings')) return
+        return setup({ effect: fn => fn(), remote: { agentTeams: {} } })
+      },
       remote: {
         $on: (name, handler) => handlers.set(name, handler),
         session: { modelCatalog: async () => ({ ok: true, value: { routableProviders: [provider] } }) },

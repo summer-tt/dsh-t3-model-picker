@@ -43,8 +43,9 @@ window.__ModuleLoader__.load({
     /** Dictionary namespace owned by this plugin. */
     const NS = 't3ModelPicker'
 
-    /** Favorites persistence key; the value is a JSON array of `{ provider, model }`. */
-    const FAVORITES_KEY = 'dsh.t3-model-picker.favorites.v1'
+    const FAVORITES_NAMESPACE = 't3-model-picker'
+    const LEGACY_FAVORITES_KEY = 'dsh.t3-model-picker.favorites.v1'
+    const REMOTE_PROVIDER = /^zr~([0-9a-f]{8})~(.+)$/u
 
     /** Number of models reachable through the jump chord (Cmd/Ctrl+1..9). */
     const JUMP_COUNT = 9
@@ -64,6 +65,12 @@ window.__ModuleLoader__.load({
       'rail.favorites': 'Favorites',
       'favorite.add': 'Add to favorites',
       'favorite.remove': 'Remove from favorites',
+      'error.favoritesLoad': 'Could not load or import model favorites: {message}',
+      'error.favoritesSave': 'Could not save model favorites: {message}',
+      'error.favoritesUnavailable': 'Model favorites are unavailable in this profile.',
+      'favorite.saving': 'Saving favorite…',
+      'favorite.readOnly': 'Favorites are read-only.',
+      'error.favoritesInterrupted': 'The connection changed while saving favorites. Check the saved list and try again.',
       'empty.models': 'No models found',
       'status.loading': 'Loading models…',
       'error.load': 'Catalog failed to load: {message}',
@@ -120,6 +127,12 @@ window.__ModuleLoader__.load({
       'rail.favorites': '收藏',
       'favorite.add': '添加收藏',
       'favorite.remove': '取消收藏',
+      'error.favoritesLoad': '无法加载或导入模型收藏：{message}',
+      'error.favoritesSave': '无法保存模型收藏：{message}',
+      'error.favoritesUnavailable': '当前 profile 无法使用模型收藏。',
+      'favorite.saving': '正在保存收藏…',
+      'favorite.readOnly': '收藏当前为只读。',
+      'error.favoritesInterrupted': '保存收藏时连接已变更，请检查收藏列表后重试。',
       'empty.models': '没有匹配的模型',
       'status.loading': '正在加载模型…',
       'error.load': '模型目录加载失败：{message}',
@@ -329,48 +342,150 @@ window.__ModuleLoader__.load({
 
     // ------------------------------------------------------------- favorites
 
-    function readFavorites() {
+    function favoriteAddress(provider, model) {
+      const remote = REMOTE_PROVIDER.exec(provider)
+      return { serverId: remote?.[1] ?? null, provider: remote?.[2] ?? provider, model }
+    }
+
+    function favoriteKey({ serverId, provider, model }) {
+      return JSON.stringify([serverId ?? null, provider, model])
+    }
+
+    function readLegacyFavorites() {
       try {
-        const raw = window.localStorage.getItem(FAVORITES_KEY)
-        if (raw === null) return []
-        const parsed = JSON.parse(raw)
-        if (!Array.isArray(parsed)) return []
-        return parsed
-          .filter(entry => entry !== null && typeof entry === 'object'
-            && typeof entry.provider === 'string' && typeof entry.model === 'string')
-          .map(entry => ({ provider: entry.provider, model: entry.model }))
+        const raw = window.localStorage.getItem(LEGACY_FAVORITES_KEY)
+        const entries = raw === null ? [] : JSON.parse(raw)
+        return {
+          raw,
+          entries: Array.isArray(entries) ? entries
+            .filter(entry => typeof entry?.provider === 'string' && entry.provider.length > 0
+              && typeof entry.model === 'string' && entry.model.length > 0)
+            .map(({ provider, model }) => favoriteAddress(provider, model)) : [],
+        }
       } catch (error) {
-        console.warn('[t3-model-picker] favorites were not readable:', error)
-        return []
+        console.warn('[t3-model-picker] legacy favorites could not be read:', error)
+        return { raw: null, entries: [] }
       }
     }
 
-    /** Favorites as one subscribable value, persisted to localStorage per toggle. */
-    function createFavoritesStore() {
-      let value = readFavorites()
+    function legacyImportReceipt(entries) {
+      return JSON.stringify([...new Set(entries.map(favoriteKey))].sort())
+    }
+
+    function createFavoritesStore(report) {
+      let connection
+      let value = { entries: readLegacyFavorites().entries, writable: false, pending: new Set(), error: 'unavailable' }
       const listeners = new Set()
+      const publish = (next) => {
+        value = { ...next, pending: new Set(connection?.pending) }
+        for (const listener of listeners) listener()
+      }
+      const requireOk = (result) => {
+        if (result.ok) return result.value
+        throw Object.assign(new Error(result.error.message), { code: result.error.code })
+      }
+      const enqueue = (target, operation) => {
+        const run = target.queue.then(() => connection === target && operation())
+        target.queue = run.catch(() => {})
+        return run
+      }
+      const sync = async (target, change) => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const document = requireOk(await target.settings.describe())
+          if (connection !== target) return
+          const section = document.namespaces.find(entry => entry.ns === FAVORITES_NAMESPACE)
+          if (!Array.isArray(section?.value?.favorites) || !Number.isSafeInteger(section.revision)) {
+            publish({ entries: readLegacyFavorites().entries, writable: false, error: 'unavailable' })
+            return
+          }
+          const writable = document.writable === true && section.applies === 'live'
+          const stored = section.value.favorites
+          const legacy = readLegacyFavorites()
+          if (!writable || (legacy.entries.length === 0 && change === undefined)) {
+            publish({ entries: stored, writable, error: null })
+            return
+          }
+          const imports = section.value.legacyFavoriteImports ?? []
+          const receipt = legacy.entries.length === 0 ? undefined : legacyImportReceipt(legacy.entries)
+          if (connection !== target) return
+          const importing = receipt !== undefined && !imports.includes(receipt)
+          const merged = new Map(stored.map(entry => [favoriteKey(entry), entry]))
+          if (importing) {
+            for (const entry of legacy.entries) merged.set(favoriteKey(entry), entry)
+          }
+          if (change !== undefined) {
+            const { entry, selected } = change
+            if (selected) merged.set(favoriteKey(entry), entry)
+            else merged.delete(favoriteKey(entry))
+          }
+          const favorites = [...merged.values()]
+          try {
+            const confirmed = !importing && JSON.stringify(favorites) === JSON.stringify(stored) ? section
+              : requireOk(await target.settings.update(FAVORITES_NAMESPACE, {
+                favorites,
+                ...(importing && { legacyFavoriteImports: [...imports, receipt] }),
+              }, section.revision))
+            if (connection !== target) return
+            publish({ entries: confirmed.value.favorites, writable, error: null })
+            if (legacy.entries.length > 0) {
+              try {
+                if (window.localStorage.getItem(LEGACY_FAVORITES_KEY) === legacy.raw) {
+                  window.localStorage.removeItem(LEGACY_FAVORITES_KEY)
+                }
+              } catch (error) {
+                console.warn('[t3-model-picker] legacy favorites could not be cleared:', error)
+              }
+            }
+            return
+          } catch (error) {
+            if (connection !== target) return
+            if (error.code === 'settings/conflict' && attempt < 2) continue
+            publish({ entries: stored, writable, error: null })
+            throw error
+          }
+        }
+      }
+      const refresh = () => {
+        const target = connection
+        if (target === undefined || target.refreshPending) return
+        target.refreshPending = true
+        void enqueue(target, async () => {
+          target.refreshPending = false
+          try {
+            await sync(target)
+          } catch (error) {
+            if (connection === target) publish({ ...value, error })
+          }
+        })
+      }
       return {
         getSnapshot: () => value,
         subscribe(listener) {
           listeners.add(listener)
           return () => { listeners.delete(listener) }
         },
-        /**
-         * Add or remove one `provider/model` entry.
-         * @param provider - the provider id.
-         * @param model - the provider-owned model id.
-         */
-        toggle(provider, model) {
-          const present = value.some(entry => entry.provider === provider && entry.model === model)
-          value = present
-            ? value.filter(entry => !(entry.provider === provider && entry.model === model))
-            : [...value, { provider, model }]
-          try {
-            window.localStorage.setItem(FAVORITES_KEY, JSON.stringify(value))
-          } catch (error) {
-            console.warn('[t3-model-picker] favorites were not persisted:', error)
-          }
-          for (const listener of [...listeners]) listener()
+        connect(settings) {
+          const interrupted = connection?.pending.size > 0
+          connection = settings === undefined ? undefined
+            : { settings, queue: Promise.resolve(), refreshPending: false, pending: new Set() }
+          publish({ ...value, writable: false, error: settings === undefined ? 'unavailable' : null })
+          refresh()
+          if (interrupted && settings !== undefined) report('error.favoritesInterrupted')
+        },
+        refresh,
+        toggle(provider, model, selected) {
+          const target = connection
+          const entry = favoriteAddress(provider, model)
+          const key = favoriteKey(entry)
+          if (target === undefined || !value.writable || target.pending.has(key)) return
+          target.pending.add(key)
+          publish(value)
+          void enqueue(target, () => sync(target, { entry, selected })).catch((error) => {
+            if (connection === target) report('error.favoritesSave', error)
+          }).finally(() => {
+            target.pending.delete(key)
+            if (connection === target) publish(value)
+          })
         },
       }
     }
@@ -1090,7 +1205,8 @@ window.__ModuleLoader__.load({
     }) {
       const state = useSnapshot(directory)
       const catalog = useSnapshot(routable)
-      const favoriteList = useSnapshot(favorites)
+      const favoriteState = useSnapshot(favorites)
+      const { entries: favoriteList } = favoriteState
       const setTeamEnabled = useSnapshot(teamRemote)
       const teamMode = useProjection('agentTeam')
       const modelSelection = useProjection('modelSelection')
@@ -1129,7 +1245,7 @@ window.__ModuleLoader__.load({
       const current = state.current
       const displaySelection = pendingTarget ?? current
       const favoriteKeys = useMemo(
-        () => new Set(favoriteList.map(entry => `${entry.provider}\u0000${entry.model}`)),
+        () => new Set(favoriteList.map(favoriteKey)),
         [favoriteList],
       )
       const routableKnown = catalog.status === 'ready'
@@ -1148,7 +1264,7 @@ window.__ModuleLoader__.load({
               model,
               groupIndex,
               modelIndex,
-              favorite: favoriteKeys.has(key),
+              favorite: favoriteKeys.has(favoriteKey(favoriteAddress(group.id, model.id))),
               unavailable: routableKnown && !routableSet.has(group.id),
             })
           })
@@ -1355,17 +1471,18 @@ window.__ModuleLoader__.load({
         return () => { window.clearInterval(timer) }
       }, [entry, pendingWindowId, running, controlOperations])
 
+      const hasVisibleFavorites = allRows.some(row => row.favorite)
       const show = useCallback(() => {
         openRef.current = true
         triggerRef.current?.focus()
-        setPane(favoriteList.length > 0 ? 'favorites' : (displaySelection?.provider ?? 'favorites'))
+        setPane(hasVisibleFavorites ? 'favorites' : (displaySelection?.provider ?? 'favorites'))
         setQuery('')
         setHighlight(0)
         setOpen(true)
         reload()
         routable.load()
         if (entry !== null) controlOperations.load(entry)
-      }, [controlOperations, displaySelection, entry, favoriteList.length, reload, routable])
+      }, [controlOperations, displaySelection, entry, hasVisibleFavorites, reload, routable])
 
       /** What the trigger click and the toggle chord both do. */
       const toggle = useCallback(() => {
@@ -1622,7 +1739,11 @@ window.__ModuleLoader__.load({
       rowRefs.current = []
 
       const renderModelRow = (row, index) => {
-        const isFavorite = favoriteKeys.has(row.key)
+        const isFavorite = row.favorite
+        const favoritePending = favoriteState.pending.has(favoriteKey(favoriteAddress(row.provider, row.model.id)))
+        const starDisabled = !favoriteState.writable || favoritePending
+        const starLabel = t(favoritePending ? 'favorite.saving' : starDisabled ? 'favorite.readOnly'
+          : isFavorite ? 'favorite.remove' : 'favorite.add')
         const isSelected = displaySelection !== null
           && displaySelection.provider === row.provider
           && displaySelection.model === row.model.id
@@ -1664,13 +1785,14 @@ window.__ModuleLoader__.load({
               role: 'button',
               tabIndex: -1,
               className: isFavorite ? 't3mp-star t3mp-star-on' : 't3mp-star',
-              'aria-label': isFavorite ? t('favorite.remove') : t('favorite.add'),
+              'aria-label': starLabel,
+              'aria-disabled': starDisabled || undefined,
               'aria-pressed': isFavorite,
-              title: isFavorite ? t('favorite.remove') : t('favorite.add'),
+              title: starLabel,
               onMouseDown: (event) => { event.preventDefault(); event.stopPropagation() },
               onClick: (event) => {
                 event.stopPropagation()
-                favorites.toggle(row.provider, row.model.id)
+                if (!starDisabled) favorites.toggle(row.provider, row.model.id, !isFavorite)
               },
             }, h(StarIcon, { filled: isFavorite, className: 't3mp-star-icon' })),
           ),
@@ -1754,6 +1876,14 @@ window.__ModuleLoader__.load({
         statusNodes.push(h('div', { className: 't3mp-error', key: 'error' },
           h('span', {}, t('error.load', { message: state.error })),
           h('button', { type: 'button', className: 't3mp-retry', onClick: reload }, t('action.retry')),
+        ))
+      }
+      if (favoriteState.error !== null) {
+        statusNodes.push(h('div', { className: 't3mp-error', key: 'favorites-error', role: 'status' },
+          h('span', {}, favoriteState.error === 'unavailable' ? t('error.favoritesUnavailable')
+            : t('error.favoritesLoad', { message: controlErrorMessage(favoriteState.error, t) })),
+          favoriteState.error === 'unavailable' ? null
+            : h('button', { type: 'button', className: 't3mp-retry', onClick: favorites.refresh }, t('action.retry')),
         ))
       }
       for (const failure of state.failures) {
@@ -2045,7 +2175,8 @@ window.__ModuleLoader__.load({
   accent-color: var(--dsw-alias-brand-primary); cursor: pointer;
 }
 .t3mp-control-slider:focus-visible { outline: 2px solid var(--dsw-alias-border-l3); outline-offset: 1px; border-radius: 4px; }
-.t3mp-control-slider[aria-disabled="true"] { opacity: 0.5; cursor: default; }
+.t3mp-star[aria-disabled="true"] { cursor: default; }
+ .t3mp-control-slider[aria-disabled="true"] { opacity: 0.5; cursor: default; }
 .t3mp-team-row {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   flex: 0 0 auto; padding: 8px 12px; border-top: 1px solid var(--dsw-alias-border-l1);
@@ -2268,9 +2399,23 @@ window.__ModuleLoader__.load({
         return () => { tag.remove() }
       }, 't3-model-picker: styles')
 
-      const favorites = createFavoritesStore()
-      const routable = createRoutableStore(ctx.remote)
       const notices = createNoticeStore()
+      const favorites = createFavoritesStore(notices.report)
+      let reconnectFavorites = () => {}
+      ctx.inject(['remote', 'remote.settings'], (scope) => {
+        scope.effect(() => {
+          reconnectFavorites = () => { favorites.connect(scope.remote.settings) }
+          reconnectFavorites()
+          return () => {
+            reconnectFavorites = () => {}
+            favorites.connect(undefined)
+          }
+        }, 't3-model-picker: profile favorites')
+        scope.remote.$on('settings/document-updated', (namespace) => {
+          if (namespace === FAVORITES_NAMESPACE) favorites.refresh()
+        })
+      })
+      const routable = createRoutableStore(ctx.remote)
       const controlOperations = createControlOperations(notices)
       let connectionGeneration
       const getBinding = (sessionId) => {
@@ -2332,10 +2477,13 @@ window.__ModuleLoader__.load({
       })
       ctx.on('connection/reset', () => {
         invalidateControls()
+        reconnectFavorites()
         refresh()
       })
       ctx.remote.$on('llm/adapters-updated', refresh)
-      ctx.remote.$on('settings/document-updated', refresh)
+      ctx.remote.$on('settings/document-updated', (namespace) => {
+        if (namespace !== FAVORITES_NAMESPACE) refresh()
+      })
 
       // Cmd/Ctrl+Shift+M opens and closes the card. It has to be
       // document-wide and live while the card is closed, so it lives here
