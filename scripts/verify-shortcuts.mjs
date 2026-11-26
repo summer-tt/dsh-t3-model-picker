@@ -89,7 +89,7 @@ const GROUPS = [
 const CURRENT = { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'medium' }
 
 /** Boot a page, load the real client half, and hand back what a check needs. */
-async function boot({ platform }) {
+async function boot({ platform, handleHostRequest }) {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {
     url: 'http://localhost/',
     pretendToBeVisual: true,
@@ -122,6 +122,12 @@ async function boot({ platform }) {
   const disposers = []
   const catalog = { ok: true, value: { routableProviders: ['deepseek', 'openai'] } }
   let seat = null
+  let draftPicker
+  const openers = new Map()
+  const sends = []
+  const directoryCalls = []
+  const hostRequests = []
+  const handlers = new Map()
   let teamError
   const team = createStore({ enabled: false })
   const teamCalls = []
@@ -129,14 +135,24 @@ async function boot({ platform }) {
   const apiCalls = []
   globalThis.fetch = async (url, request) => {
     apiCalls.push({ url: String(url), method: request.method })
+    if (String(url) === '/_dsh/zen-remote/client/session-host') {
+      const body = JSON.parse(request.body)
+      hostRequests.push(body)
+      return handleHostRequest(body, request.signal)
+    }
     return new Response('Not found', { status: 404 })
   }
   const bindings = new Map()
   const ctx = {
     effect(fn) { disposers.push(fn()) },
-    on() {},
+    on(name, listener) { handlers.set(name, listener) },
+    provide(name, service) { if (name === 't3ModelPicker') draftPicker = service.DraftPicker },
     inject(_keys, setup) { setup(ctx) },
-    locale: { register(_ns, dicts) { dictionary = dicts.en } },
+    locale: {
+      ...createStore({ active: 'en' }),
+      register(_ns, dicts) { dictionary = dicts.en },
+      bind() { return t },
+    },
     remote: {
       $on() {},
       session: { modelCatalog: () => Promise.resolve(catalog) },
@@ -152,12 +168,18 @@ async function boot({ platform }) {
     slots: {
       inject(_name, loadSeat) { return loadSeat() },
       register(options, component) {
-        if (options.name === 'conversation.input.model') seat = { component, props: options.inject('session-1') }
+        if (options.name === 'conversation.input.model') seat = { component, inject: options.inject }
         return () => {}
       },
     },
     modelDirectories: {
-      directoryFor: () => {
+      registerPickerOpener({ sessionId, composerId }, open) {
+        const key = `${sessionId}:${composerId}`
+        openers.set(key, open)
+        return () => { openers.delete(key) }
+      },
+      directoryFor: (sessionId) => {
+        directoryCalls.push(sessionId)
         const store = createStore(
           { status: 'ready', groups: GROUPS, current: CURRENT, failures: [], error: null },
           { load: () => Promise.resolve(), select: () => Promise.resolve({ ok: true }) },
@@ -172,7 +194,7 @@ async function boot({ platform }) {
           sessionId,
           session: {
             beginSubmission: () => ({ requestId: 'fixture', abandon() {} }),
-            prompt: async () => ({ ok: true }),
+            async prompt() { sends.push(sessionId); return { ok: true } },
           },
         })
         return bindings.get(sessionId)
@@ -207,7 +229,10 @@ async function boot({ platform }) {
   window.document.body.appendChild(container)
   const root = ReactDOM.createRoot(container)
 
+  const seats = new Map()
   const render = async (count, overrides = {}) => {
+    const sessionId = overrides.sessionId ?? 'session-1'
+    if (!seats.has(sessionId)) seats.set(sessionId, seat.inject(sessionId))
     await act(async () => {
       root.render(h(
         'div',
@@ -215,7 +240,7 @@ async function boot({ platform }) {
         ...Array.from({ length: count }, (_, index) => h(
           seat.component,
           {
-            ...seat.props, t, key: `seat-${index}`, sessionId: 'session-1',
+            ...seats.get(sessionId), t, key: `${sessionId}:${index}`, sessionId,
             useSession: selector => selector({ subagent: null }),
             useSessions: selector => selector({ byId: {} }),
             useProjection: name => {
@@ -239,7 +264,14 @@ async function boot({ platform }) {
   const click = async (node) => { await act(async () => { node.click() }) }
 
   return {
-    window, act, render, press, click, t, team, teamCalls, apiCalls,
+    window, React, act, render, press, click, t, team, teamCalls, apiCalls, openers, directoryCalls, hostRequests, sends,
+    submit(sessionId) {
+      const { session } = ctx.sessions.binding(sessionId)
+      const { requestId } = session.beginSubmission()
+      return session.prompt([{ type: 'text', text: 'test' }], 'queue', undefined, requestId)
+    },
+    reset: async () => { await act(async () => { handlers.get('connection/reset')() }) },
+    renderDraft: async (props) => { await act(async () => { root.render(h(draftPicker, props)) }) },
     failTeam: (message) => { teamError = message },
     panels: () => window.document.querySelectorAll('.t3mp-panel').length,
     triggers: () => window.document.querySelectorAll('.t3mp-trigger'),
@@ -374,8 +406,11 @@ async function main() {
 
   // Two seats mounted, as two live sessions would: one keystroke, one card.
   await mac.render(2)
-  await mac.press(MAC)
+  const firstSeat = mac.triggers()[0]
+  await mac.act(() => { firstSeat.focus() })
+  await mac.press(MAC, firstSeat)
   check('two mounted seats open exactly one card', mac.panels() === 1, `panels=${mac.panels()}`)
+  check('the chord prefers the focused seat', firstSeat.getAttribute('aria-expanded') === 'true')
   check('exactly one seat reports itself open', mac.expanded() === 1, `expanded=${mac.expanded()}`)
   await mac.press(MAC)
   check('the chord closes it again', mac.panels() === 0, `panels=${mac.panels()}`)
@@ -463,8 +498,156 @@ async function main() {
   await pc.unmount()
   pc.dispose()
 
+  await checkHostScopedPickers()
   console.log(`\n${checks - failures} of ${checks} checks passed`)
   process.exit(failures === 0 ? 0 : 1)
+}
+
+async function checkHostScopedPickers() {
+  console.log('\nSession Host and draft picker:')
+  const hostId = '1234abcd'
+  const sessionId = `zr~${hostId}~session-remote`
+  const composerId = 'composer-1'
+  const first = { provider: 'deepseek', model: CURRENT.model, reasoningEffort: 'medium' }
+  const next = { provider: 'deepseek', model: 'deepseek-chat' }
+  const remoteGroups = [{ ...GROUPS[0], name: 'Remote DeepSeek' }]
+  const catalog = { groups: remoteGroups, failures: [], default: first, routableProviders: ['deepseek'] }
+  const localGroups = [...GROUPS, { id: `zr~${hostId}~deepseek`, name: 'Virtual group', models: GROUPS[0].models }]
+  let favorites = [first]
+  let offline = false
+  let blockSelect
+  let activeSelect
+  const app = await boot({
+    platform: 'Win32',
+    async handleHostRequest(request, signal) {
+      if (offline) return Response.json({ ok: false, error: { code: 'remote-offline' } }, { status: 503 })
+      if (request.operation === 'modelCatalog') return Response.json({ ok: true, value: catalog })
+      if (request.operation === 'getFavorites') return Response.json({ ok: true, value: { favorites } })
+      if (request.operation === 'setFavorite') {
+        favorites = request.favorite ? [request] : []
+        return Response.json({ ok: true, value: { favorites } })
+      }
+      activeSelect = signal
+      if (blockSelect) await blockSelect.promise
+      return Response.json({ ok: true, value: { selected: request } })
+    },
+  })
+  const query = selector => app.window.document.querySelector(selector)
+  const row = model => [...app.window.document.querySelectorAll('.t3mp-row')].find(node =>
+    node.querySelector('.t3mp-row-name')?.textContent === model)
+  const trigger = () => app.triggers()[0].querySelector('.t3mp-trigger-label')?.textContent
+  const projection = createStore({ next: null, lastUsed: null })
+  const props = {
+    sessionId, composerId,
+    useProjection: () => app.React.useSyncExternalStore(projection.subscribe, projection.getSnapshot),
+  }
+  const openerKey = `${sessionId}:${composerId}`
+  const open = () => app.act(async () => {
+    check('the Session /model callback accepts the visible composer', app.openers.get(openerKey)?.())
+  })
+
+  try {
+    await app.render(1, { directory: createStore({ status: 'ready', groups: localGroups, current: CURRENT, failures: [], error: null }) })
+    await app.click(app.triggers()[0])
+    check('the local picker filters the virtual group while keeping the local default',
+      query('[data-t3mp-rail^="zr~"]') === null && trigger() === 'DeepSeek Reasoner')
+    const beforeRemote = app.apiCalls.length
+    await app.render(1, props)
+    check('a blank remote Session shows its own catalog default', trigger() === 'DeepSeek Reasoner')
+    await open()
+    check('the remote pane has only the original provider and target favorites',
+      query('[data-t3mp-rail="deepseek"]')?.getAttribute('aria-label') === 'deepseek' && query('[data-t3mp-rail="openai"]') === null
+        && row('DeepSeek Reasoner')?.querySelector('.t3mp-star-on') !== null)
+    await open()
+    check('calling /model twice keeps the card open and focuses search', app.panels() === 1
+      && app.window.document.activeElement === app.search())
+    await app.click(row('DeepSeek Reasoner').querySelector('.t3mp-star'))
+    const matches = (operation, fields) => app.hostRequests.some(request => request.operation === operation
+      && request.sessionId === sessionId && Object.entries(fields).every(([key, value]) => request[key] === value))
+    check('star toggles use the remote Session and original provider', matches('setFavorite', {
+      provider: first.provider, model: first.model, favorite: false,
+    }))
+    await app.click(query('[data-t3mp-rail="deepseek"]'))
+    blockSelect = Promise.withResolvers()
+    await app.click(row('DeepSeek Chat'))
+    check('model selection uses the remote Session and original provider', matches('selectModel', next))
+    let send
+    await app.act(async () => { send = app.submit(sessionId) })
+    check('a prompt waits for remote model selection before sending', app.sends.length === 0)
+    await app.act(async () => { blockSelect.resolve(); await send })
+    blockSelect = undefined
+    check('a confirmed selection releases the prompt and updates the trigger', app.sends[0] === sessionId
+      && trigger() === 'DeepSeek Chat')
+    await open()
+    await app.act(() => projection.setSnapshot({ next: { ...first, provider: `zr~${hostId}~deepseek`, reasoningEffort: 'high' } }))
+    check('same-Host projected selection decodes without changing the projection', trigger() === 'DeepSeek Reasoner'
+      && query('.t3mp-trigger-effort')?.textContent === 'High'
+      && projection.getSnapshot().next.provider === `zr~${hostId}~deepseek`)
+    blockSelect = Promise.withResolvers()
+    const effort = query('[data-t3mp-control="effort"]')
+    await app.act(async () => {
+      effort.focus()
+      Object.getOwnPropertyDescriptor(app.window.HTMLInputElement.prototype, 'value').set.call(effort, '0')
+      effort.dispatchEvent(new app.window.Event('input', { bubbles: true }))
+    })
+    check('a remote reasoning change uses the original provider and keeps keyboard focus while saving',
+      matches('selectModel', { provider: first.provider, model: first.model, reasoningEffort: 'low' })
+        && app.window.document.activeElement === effort && effort.getAttribute('aria-disabled') === 'true')
+    await app.act(() => { blockSelect.resolve() })
+    blockSelect = undefined
+    check('the remote slider retains focus and becomes editable after confirmation',
+      app.window.document.activeElement === effort && effort.getAttribute('aria-disabled') === null)
+    await app.act(() => projection.setSnapshot({ next: { ...first, provider: 'zr~8765dcba~deepseek' } }))
+    check('another Host’s projected provider is ignored', trigger() === 'Select model')
+    check('a remote Session never uses the local directory or Magpie API',
+      app.directoryCalls.every(id => id !== sessionId) && !app.apiCalls.slice(beforeRemote).some(call => call.url.includes('magpie-session-controls')))
+
+    blockSelect = Promise.withResolvers()
+    await app.click(row('DeepSeek Chat'))
+    await app.act(async () => { send = app.submit(sessionId) })
+    offline = true
+    await app.reset()
+    check('a connection reset aborts the outstanding remote selection', activeSelect?.aborted === true)
+    check('a prompt waiting on an interrupted selection never reaches the remote Session',
+      (await send).ok === false && app.sends.length === 1)
+    await open()
+    await app.act(() => { blockSelect.resolve() })
+    check('an offline Host shows errors without loading catalog or favorites from this Host',
+      query('.t3mp-panel')?.textContent.includes('remote-offline') && query('[data-t3mp-rail="deepseek"]') === null
+        && trigger() !== 'DeepSeek Chat')
+
+    const openerRef = { current: null }
+    const choices = []
+    const stars = []
+    const draft = { hostId, catalog, selection: null, openerRef, onSelect: value => choices.push(value),
+      favorites: [], setFavorite: value => stars.push(value) }
+    const beforeDraft = app.apiCalls.length
+    await app.renderDraft({ ...draft, catalog: null })
+    await app.act(async () => { openerRef.current() })
+    await app.renderDraft(draft)
+    check('a picker opened before loading selects the default provider when the catalog arrives',
+      query('[data-t3mp-rail="deepseek"]')?.getAttribute('aria-pressed') === 'true')
+    check('DraftPicker opens the same panel and displays its Host default',
+      trigger() === 'DeepSeek Reasoner' && row('DeepSeek Chat') !== undefined)
+    await app.click(row('DeepSeek Chat').querySelector('.t3mp-star'))
+    check('DraftPicker forwards a scoped favorite intent', stars[0]?.provider === 'deepseek'
+      && stars[0]?.model === next.model && stars[0]?.favorite === true)
+    await app.click(row('DeepSeek Chat'))
+    check('DraftPicker returns the raw model choice and closes the shared card',
+      choices[0]?.provider === 'deepseek' && choices[0]?.model === next.model && app.panels() === 0
+        && app.apiCalls.length === beforeDraft)
+    await app.renderDraft({ ...draft, selection: { ...first, reasoningEffort: 'high' } })
+    await app.act(async () => { openerRef.current() })
+    await app.click(row('DeepSeek Reasoner'))
+    check('reselecting the draft model preserves its edited reasoning effort', choices.at(-1)?.reasoningEffort === 'high')
+    await app.act(async () => { openerRef.current() })
+    await app.renderDraft({ ...draft, hostId: '8765dcba', catalog: null })
+    check('changing Host discards the previously open draft card', app.panels() === 0 && trigger() === 'Loading models…')
+    await app.unmount()
+    check('closing the draft panel releases both opener handles', openerRef.current === null && app.openers.size === 0)
+  } finally {
+    app.dispose()
+  }
 }
 
 await main()

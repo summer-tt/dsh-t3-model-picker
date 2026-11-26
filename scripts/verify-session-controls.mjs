@@ -230,6 +230,7 @@ try {
       react: React, 'react-dom': ReactDOM, '@deepseek-ai/dsh-client-ui-primitives': {},
     })[pkg]).apply({
       locale: { register: (_, values) => { dictionary = values.en } },
+      provide() {},
       effect: fn => fn(),
       on: (name, handler) => handlers.set(name, handler),
       inject: (keys, setup) => {

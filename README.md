@@ -85,8 +85,59 @@ surfaces show next, and a selection made there is what this picker highlights.
 |---|---|
 | `package.json` | Bundle manifest: `dsh.bundle.patch` plus the `dsh.client` web half |
 | `cordis.patch.yml` | One `insert` row mounting the bundle |
-| `index.js` | Host half — empty; the feature is entirely browser-side |
+| `index.js` | Host half: the favorites read and single-entry set route, and the Zen Remote bridge declaration |
 | `client.js` | Client half: the picker, its styles, favorites and shortcuts |
+
+### Favorites Host route
+
+The Host half serves two exact routes: `/api/t3-model-picker/favorites` for
+`GET` and `/api/t3-model-picker/favorites/set` for `POST`. DSH's `/api`
+registry applies its Host/Origin checks, the signed browser or API credential,
+and its owner-only gate before either route runs, so only this Host's
+authenticated owner can reach them.
+
+- `GET` returns `{ ok: true, value: { favorites: [{ provider, model }] } }`:
+  this Host's own favorites, with the provider and model IDs as stored. Entries
+  kept for another Host (`serverId` set), the legacy import receipts, and every
+  other profile field stay off the wire.
+- `POST` takes `{ provider, model, favorite }` on the `/set` route and sets
+  exactly that one favorite: `favorite: true` adds it unless present,
+  `favorite: false` removes it unless absent. Every other row is kept as it is,
+  including other Hosts' records and the legacy import receipts. The answer is
+  the authoritative list re-read after the write, in the same envelope as `GET`.
+
+A provider + model holds at most one row on a Host. `GET` answers each address
+once, and `favorite: true` folds a duplicate that reached the document (two
+browsers starring one model between two revisions) down to one row. A row
+without a `serverId` key — Schemastery leaves the key out when it is missing
+instead of writing the `null` default — is this Host's own, exactly like an
+explicit `null`.
+
+A refusal is `{ ok: false, error: { code } }` with no other detail. The body
+must be `application/json` and at most 4 KiB; `provider` and `model` are
+strings of 1–256 characters without control characters, `favorite` is a
+boolean, and no other field is accepted (`bad-request`, `body-too-large`,
+`unsupported-media-type`). The write carries the settings revision it read;
+when a concurrent writer moved it, the route re-reads and merges again, up to
+three times, before answering `settings/conflict`. A profile whose favorites
+entry is missing answers `favorites-unavailable`; one that does not apply
+changes live answers `favorites-readonly`.
+
+The read and the write are separate routes because DSH picks one body mode per
+route. The read is buffered, which costs nothing because a `GET` has no body;
+it cannot stream, since the Fetch API refuses a body on `GET` and the request
+would fail with 400 before the route runs. The write streams: in the buffered
+mode DSH reads the whole body into memory before the route, up to its carrier
+cap of 300 MiB, and only then would the 4 KiB limit apply. Streaming holds
+nothing up front — the route reads at most its cap plus one chunk and cancels,
+and DSH closes the connection instead of draining the rest.
+
+Both routes are also declared to Zen Remote for a paired Host, as
+`scope: 'server'` routes with `locator: { in: 'host' }`, so the relay forwards
+them by Host without a session and the server owner consents per plugin. The
+declaration is handed over only when the running Zen Remote advertises
+`zenRemote.supportsHostLocator`; an older Zen Remote refuses `/api` paths, so
+it receives nothing and the local routes keep serving browsers.
 
 ## Differences from T3 Code
 
@@ -127,6 +178,23 @@ has no dependencies, so the harness brings its own:
 npm install --no-save react react-dom jsdom
 node scripts/verify-shortcuts.mjs
 ```
+
+Two scripts check the favorites Host route in `index.js` without a browser:
+
+```sh
+node scripts/verify-host-favorites.mjs      # the route's contract, on in-memory doubles
+node scripts/verify-host-favorites-dsh.mjs  # the same route on the shipped DSH services
+```
+
+The first covers the read projection, the single-entry set, the revision
+retry, validation and the bridge declaration. The second runs the routes on
+the installed DeepSeek Harness's own services: its `/api` registry and settings
+service, so the owner gate, the method dispatch and the revision check are the
+shipped ones, and then over a real `node:http` listener with the shipped
+carrier, where it sends an 8 MiB body and asserts that the server refuses it
+after reading well under 1 MiB. Both resolve `@deepseek-ai/schemastery` from
+the running installation; set `DSH_INSTALL_DIR` to its `@deepseek-ai/dsh`
+package directory when it is not the default one.
 
 `scripts/` also holds the recording tooling used for the assets above. It drives
 the running DeepSeek Harness page over the Chrome DevTools Protocol, so no

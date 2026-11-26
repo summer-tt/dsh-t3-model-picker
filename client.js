@@ -8,9 +8,9 @@
  *
  * Registers a second occupant of the composer's `conversation.input.model`
  * seat at priority -1, so it shadows the shipped ModelSelect (same cell,
- * different priority = shadowing) while reading the SAME per-session model
- * directory (`ctx.modelDirectories`) that seat and the `/model` popup use.
- * A switch made here is what those surfaces show next.
+ * different priority = shadowing). Local Sessions use the native directory
+ * with Zen's virtual groups removed. Remote Sessions read and write through
+ * the Zen route for their own Session, using that Host's original model IDs.
  *
  * Shape and behavior follow T3 Code's ProviderModelPicker: a 44px provider
  * rail on the left (Favorites first), a borderless search field at the top of
@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
 
     const h = React.createElement
     const {
-      useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
+      useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
     } = React
 
     /** Dictionary namespace owned by this plugin. */
@@ -45,7 +45,14 @@ window.__ModuleLoader__.load({
 
     const FAVORITES_NAMESPACE = 't3-model-picker'
     const LEGACY_FAVORITES_KEY = 'dsh.t3-model-picker.favorites.v1'
-    const REMOTE_PROVIDER = /^zr~([0-9a-f]{8})~(.+)$/u
+    const REMOTE_PROVIDER = /^zr~([0-9a-f]{8})~/u
+    const SESSION_HOST_ROUTE = '/_dsh/zen-remote/client/session-host'
+    const EMPTY_LIST = []
+    const EMPTY_PENDING = new Set()
+
+    function originalProvider(provider) {
+      return typeof provider === 'string' && provider.length > 0 && !provider.startsWith('zr~')
+    }
 
     /** Number of models reachable through the jump chord (Cmd/Ctrl+1..9). */
     const JUMP_COUNT = 9
@@ -326,8 +333,8 @@ window.__ModuleLoader__.load({
     /**
      * The mounted pickers, in mount order. The chord is document-wide and the
      * card has to answer it while closed, so one listener in `apply` serves
-     * every seat; the seat that takes the keystroke is the last mounted one
-     * still on screen and not locked.
+     * every seat. Prefer the visible seat in the focused composer or draft,
+     * and use mount order when focus is outside those surfaces.
      */
     const mountedPickers = new Set()
 
@@ -335,7 +342,9 @@ window.__ModuleLoader__.load({
     function toggleTarget() {
       let target = null
       for (const picker of mountedPickers) {
-        if (picker.enabled()) target = picker
+        if (!picker.enabled()) continue
+        if (picker.hasFocus()) return picker
+        target = picker
       }
       return target
     }
@@ -344,7 +353,7 @@ window.__ModuleLoader__.load({
 
     function favoriteAddress(provider, model) {
       const remote = REMOTE_PROVIDER.exec(provider)
-      return { serverId: remote?.[1] ?? null, provider: remote?.[2] ?? provider, model }
+      return { serverId: remote?.[1] ?? null, provider: remote ? provider.slice(remote[0].length) : provider, model }
     }
 
     function favoriteKey({ serverId, provider, model }) {
@@ -490,6 +499,164 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // ----------------------------------------------------------- Session Host
+
+    function localDirectoryState(state) {
+      return {
+        ...state,
+        groups: state.groups.filter(group => originalProvider(group.id)),
+        failures: state.failures.filter(failure => originalProvider(failure.id)),
+        current: originalProvider(state.current?.provider) ? state.current : null,
+      }
+    }
+
+    function originalSelection(selection) {
+      if (!originalProvider(selection?.provider) || typeof selection.model !== 'string' || selection.model.length === 0) return null
+      return {
+        provider: selection.provider,
+        model: selection.model,
+        ...(validEffort(selection.reasoningEffort) && { reasoningEffort: selection.reasoningEffort }),
+      }
+    }
+
+    function projectedSelection(projection, hostId, fallback) {
+      const selection = projection?.next ?? projection?.lastUsed
+      if (selection == null) return projection === undefined ? null : originalSelection(fallback)
+      const parts = typeof selection.provider === 'string' && REMOTE_PROVIDER.exec(selection.provider)
+      return parts?.[1] === hostId
+        ? originalSelection({ ...selection, provider: selection.provider.slice(parts[0].length) })
+        : null
+    }
+
+    async function requestSessionHost(sessionId, operation, signal, input) {
+      const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(30_000)])
+      const response = await fetch(SESSION_HOST_ROUTE, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ operation, sessionId, ...input }),
+        mode: 'same-origin',
+        credentials: 'same-origin',
+        redirect: 'error',
+        cache: 'no-store',
+        signal: requestSignal,
+      })
+      const payload = await response.json().catch(() => undefined)
+      requestSignal.throwIfAborted()
+      if (response.ok && payload?.ok === true) return payload.value
+      const { code, message } = payload?.error ?? {}
+      throw Object.assign(new Error(message ?? code ?? `HTTP ${response.status}`), { code })
+    }
+
+    function createPickerStore(initial) {
+      let value = initial
+      const listeners = new Set()
+      return {
+        getSnapshot: () => value,
+        subscribe(listener) {
+          listeners.add(listener)
+          return () => { listeners.delete(listener) }
+        },
+        publish(next) {
+          value = next
+          for (const listener of listeners) listener()
+        },
+      }
+    }
+
+    const EMPTY_CATALOG = { value: null, error: null }
+    const EMPTY_FAVORITES = { entries: EMPTY_LIST, pending: EMPTY_PENDING, writable: false, error: null }
+
+    function createSessionHost(sessionId, report) {
+      const catalog = createPickerStore(EMPTY_CATALOG)
+      const favoriteStore = createPickerStore(EMPTY_FAVORITES)
+      let connection
+
+      const load = () => {
+        const target = connection
+        if (target === undefined || target.loading) return
+        target.loading = requestSessionHost(sessionId, 'modelCatalog', target.signal).then(value => {
+          if (!Array.isArray(value?.groups) || !value.groups.every(group =>
+            typeof group?.id === 'string' && Array.isArray(group.models)) || !Array.isArray(value.routableProviders)) {
+            throw new Error('Invalid model catalog response')
+          }
+          if (!target.signal.aborted) catalog.publish({ value, error: null })
+        }).catch(error => {
+          if (!target.signal.aborted) catalog.publish({ value: null, error: error.message })
+        }).finally(() => { target.loading = undefined })
+      }
+
+      const publishFavorites = (target, next) => {
+        if (!target.signal.aborted) favoriteStore.publish({ ...next, pending: new Set(target.pending) })
+      }
+      const enqueueFavorites = (target, operation, input, onError) => {
+        target.favoritesQueue = target.favoritesQueue.then(async () => {
+          if (target.signal.aborted) return
+          try {
+            const value = await requestSessionHost(sessionId, operation, target.signal, input)
+            if (!Array.isArray(value?.favorites)) throw new Error('Invalid favorites response')
+            const entries = value.favorites.filter(entry => originalSelection(entry) !== null)
+            publishFavorites(target, { entries, writable: true, error: null })
+          } catch (error) {
+            if (!target.signal.aborted) onError(error)
+          }
+        })
+        return target.favoritesQueue
+      }
+      const favorites = {
+        ...favoriteStore,
+        refresh() {
+          const target = connection
+          if (target === undefined || target.refreshing) return
+          target.refreshing = true
+          void enqueueFavorites(target, 'getFavorites', undefined, error => {
+            publishFavorites(target, { ...EMPTY_FAVORITES, error })
+          }).finally(() => { target.refreshing = false })
+        },
+        toggle(provider, model, favorite) {
+          const target = connection
+          const key = favoriteKey({ provider, model })
+          if (target === undefined || !favoriteStore.getSnapshot().writable || target.pending.has(key)
+            || !originalProvider(provider)) return
+          target.pending.add(key)
+          publishFavorites(target, favoriteStore.getSnapshot())
+          void enqueueFavorites(target, 'setFavorite', { provider, model, favorite }, error => {
+            publishFavorites(target, { ...favoriteStore.getSnapshot(), writable: false, error })
+            report('error.favoritesSave', error)
+          }).finally(() => {
+            target.pending.delete(key)
+            publishFavorites(target, favoriteStore.getSnapshot())
+          })
+        },
+      }
+      return {
+        catalog,
+        favorites,
+        connect() {
+          const controller = new AbortController()
+          connection = { signal: controller.signal, pending: new Set(), favoritesQueue: Promise.resolve() }
+          load()
+          favorites.refresh()
+          return () => {
+            controller.abort()
+            connection = undefined
+            catalog.publish(EMPTY_CATALOG)
+            favoriteStore.publish(EMPTY_FAVORITES)
+          }
+        },
+        load,
+        async select(selection) {
+          const signal = connection?.signal
+          if (signal === undefined || !originalProvider(selection.provider)) throw new Error('Model selection unavailable')
+          const value = await requestSessionHost(sessionId, 'selectModel', signal, selection)
+          const selected = originalSelection(value?.selected)
+          if (selected?.provider !== selection.provider || selected.model !== selection.model) {
+            throw new Error('Invalid model selection response')
+          }
+          return selected
+        },
+      }
+    }
+
     // ---------------------------------------------------------- availability
 
     /**
@@ -516,7 +683,7 @@ window.__ModuleLoader__.load({
           .then(() => remote.session.modelCatalog())
           .then((response) => {
             if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`)
-            publish({ status: 'ready', providers: [...response.value.routableProviders] })
+            publish({ status: 'ready', providers: response.value.routableProviders.filter(originalProvider) })
           })
           .catch((error) => {
             console.warn('[t3-model-picker] provider availability unavailable:', error)
@@ -1194,31 +1361,173 @@ window.__ModuleLoader__.load({
     const PANEL_MAX_HEIGHT = 346
     const PANEL_MARGIN = 12
 
-    /**
-     * The composer's model seat: trigger plus, while open, the T3-shaped card.
-     * @param props - owner share (`locked`), the injected face, and the `t` seat.
-     * @returns the seated control.
-     */
-    function ModelPicker({
-      locked, available, directory, load, select, favorites, routable, teamRemote, controlOperations, guard, getBinding,
-      sessionId, useProjection, useSession, useSessions, t,
-    }) {
-      const state = useSnapshot(directory)
+    const EMPTY_AVAILABILITY = { status: 'idle', providers: EMPTY_LIST }
+    const NO_PROFILE_FAVORITES = createPickerStore(undefined)
+    const EMPTY_FAVORITES_STORE = createPickerStore(EMPTY_FAVORITES)
+    const EMPTY_DIRECTORY = createPickerStore({ current: null })
+    const EMPTY_CONTROLS = createPickerStore(0)
+    const NOOP = () => {}
+    const NO_BINDING = () => null
+
+    function hostDirectoryState(catalog, selection, error = null) {
+      return {
+        groups: catalog?.groups.filter(group => originalProvider(group.id)) ?? EMPTY_LIST,
+        failures: catalog?.failures?.filter(failure => originalProvider(failure.id)) ?? EMPTY_LIST,
+        current: selection,
+        status: error !== null ? 'error' : catalog == null ? 'loading' : 'ready',
+        error,
+      }
+    }
+
+    function hostAvailability(catalog) {
+      return catalog == null ? EMPTY_AVAILABILITY
+        : { status: 'ready', providers: catalog.routableProviders.filter(originalProvider) }
+    }
+
+    function LocalSessionPicker(props) {
+      const { directory, routable, teamRemote, sessionId, useProjection, useSession, useSessions } = props
+      const directoryState = useSnapshot(directory)
+      const state = useMemo(() => localDirectoryState(directoryState), [directoryState])
       const catalog = useSnapshot(routable)
-      const favoriteState = useSnapshot(favorites)
-      const { entries: favoriteList } = favoriteState
+      const load = useCallback(() => {
+        props.load()
+        routable.load()
+      }, [props.load, routable])
       const setTeamEnabled = useSnapshot(teamRemote)
       const teamMode = useProjection('agentTeam')
       const modelSelection = useProjection('modelSelection')
       const addressedChild = useSession(snapshot => snapshot.subagent !== null)
       const running = useSession(snapshot => snapshot.running === true)
       const listedChild = useSessions(snapshot => snapshot.byId[sessionId]?.origin === 'subagent')
+      return h(ModelPicker, {
+        ...props, load, state, catalog, setTeamEnabled, teamMode, modelSelection, running,
+        showTeam: !addressedChild && !listedChild,
+      })
+    }
+
+    function RemoteSessionPicker({
+      sessionId, hostId, locked, connectionEpoch, available, useProjection, useSession, report,
+      guard, getBinding, selectionOperations, ...props
+    }) {
+      const epoch = useSnapshot(connectionEpoch)
+      const backend = useMemo(() => createSessionHost(sessionId, report), [epoch, report, sessionId])
+      const projection = useProjection('modelSelection')
+      const running = useSession(snapshot => snapshot.running === true)
+      const { value: catalog, error } = useSnapshot(backend.catalog)
+      const [pendingTarget, setPending] = useState(undefined)
+      const [receipt, setReceipt] = useState(null)
+      const lifetime = useRef(null)
+      const binding = getBinding()
+      useLayoutEffect(() => {
+        const token = {}
+        lifetime.current = token
+        setPending(undefined)
+        setReceipt(null)
+        const disconnect = available ? backend.connect() : NOOP
+        return () => {
+          lifetime.current = null
+          disconnect()
+        }
+      }, [available, backend])
+      const seenProjection = useRef(projection)
+      useLayoutEffect(() => {
+        seenProjection.current = projection
+        setReceipt(null)
+      }, [projection])
+      const current = receipt?.selection ?? projectedSelection(projection, hostId, catalog?.default)
+      const state = useMemo(() => hostDirectoryState(catalog, current, error), [catalog, current, error])
+      const availability = useMemo(() => hostAvailability(catalog), [catalog])
+      const applySelection = useCallback((selection) => {
+        const token = lifetime.current
+        if (locked || !available || token == null || binding == null || getBinding() !== binding
+          || selectionOperations.has(binding)) return
+        setPending(selection)
+        const operation = backend.select(selection).then((selected) => {
+          if (lifetime.current !== token) return
+          if (seenProjection.current === projection) setReceipt({ selection: selected })
+        }).catch((error) => {
+          if (lifetime.current === token) report('error.action', error)
+          throw error
+        }).finally(() => {
+          selectionOperations.delete(binding)
+          if (lifetime.current === token) setPending(undefined)
+        })
+        selectionOperations.set(binding, operation)
+        void operation.catch(() => {})
+      }, [available, backend, binding, getBinding, locked, projection, report, selectionOperations])
+      const waitForSelection = useCallback(() => selectionOperations.get(binding), [binding, selectionOperations])
+      const load = useCallback(() => {
+        backend.load()
+        backend.favorites.refresh()
+      }, [backend])
+      return h(ModelPicker, {
+        ...props, sessionId, locked, available, running, state, catalog: availability, pendingTarget, applySelection,
+         showProviderIds: true,
+        load, favorites: backend.favorites, guard, getBinding, waitForSelection, generation: epoch,
+      })
+    }
+
+    function DraftPickerView({
+      hostId, catalog, catalogError = null, selection, onSelect, openerRef, disabled = false,
+      favorites, setFavorite, favoritesError = null, onReload = NOOP, onReloadFavorites = NOOP,
+      locale, profileFavorites, report,
+    }) {
+      useSnapshot(locale)
+      const profile = useSnapshot(hostId === 'local' && favorites === undefined ? profileFavorites : NO_PROFILE_FAVORITES)
+      const [pending, setPending] = useState(EMPTY_PENDING)
+      const writes = useRef(new Set())
+      const favoriteState = profile ?? {
+        entries: favorites?.filter(entry => originalSelection(entry) !== null) ?? EMPTY_LIST,
+        writable: setFavorite !== undefined && favoritesError === null && !disabled,
+        error: favoritesError,
+        pending,
+      }
+      const toggle = async (provider, model, favorite) => {
+        if (profile !== undefined) {
+          if (!disabled) profileFavorites.toggle(provider, model, favorite)
+          return
+        }
+        const key = favoriteKey({ provider, model })
+        if (!favoriteState.writable || writes.current.has(key) || !originalProvider(provider)) return
+        writes.current.add(key)
+        setPending(new Set(writes.current))
+        try {
+          await setFavorite({ provider, model, favorite })
+        } catch (error) {
+          report('error.favoritesSave', error)
+        } finally {
+          writes.current.delete(key)
+          setPending(new Set(writes.current))
+        }
+      }
+      const current = originalSelection(selection) ?? originalSelection(catalog?.default)
+      const state = hostDirectoryState(catalog, current, catalogError)
+      return h(ModelPicker, {
+        sessionId: hostId, available: true, locked: disabled, state, catalog: hostAvailability(catalog),
+        load: onReload, favoriteState, toggleFavorite: toggle,
+        reloadFavorites: profile === undefined ? onReloadFavorites : profileFavorites.refresh,
+        applySelection: onSelect, openerRef, draftMode: true, showProviderIds: true, t: locale.bind(NS),
+      })
+    }
+
+    /** Shared trigger and card for a Session or a new-conversation draft. */
+    function ModelPicker({
+      locked, available, directory = EMPTY_DIRECTORY, state, catalog, load, select, favorites = EMPTY_FAVORITES_STORE,
+      favoriteState: controlledFavorites, toggleFavorite = favorites.toggle, reloadFavorites = favorites.refresh,
+      setTeamEnabled, teamMode, modelSelection, showTeam, running = false,
+      controlOperations, guard, getBinding = NO_BINDING, generation: connectionEpoch, waitForSelection,
+      pendingTarget: selectionTarget, applySelection,
+      sessionId, composerId, registerPickerOpener, openerRef, draftMode = false, showProviderIds = false, t,
+    }) {
+      const storedFavorites = useSnapshot(favorites)
+      const favoriteState = controlledFavorites ?? storedFavorites
+      const { entries: favoriteList } = favoriteState
       const [teamPending, setTeamPending] = useState(false)
       const [disableRequest, setDisableRequest] = useState(null)
 
       const [open, setOpen] = useState(false)
       const [guardedBinding, setGuardedBinding] = useState(null)
-      const [pane, setPane] = useState('favorites')
+      const [chosenPane, setPane] = useState(null)
       const [query, setQuery] = useState('')
       const [highlight, setHighlight] = useState(0)
       const [menuPos, setMenuPos] = useState(null)
@@ -1238,9 +1547,9 @@ window.__ModuleLoader__.load({
       const waitRef = useRef(null)
       const [, redrawDraft] = useState(0)
 
-      useSnapshot(controlOperations)
+      useSnapshot(controlOperations ?? EMPTY_CONTROLS)
       const binding = getBinding()
-      const pendingTarget = controlOperations.modelTarget(binding)
+      const pendingTarget = controlOperations?.modelTarget(binding) ?? selectionTarget
       const groups = state.groups
       const current = state.current
       const displaySelection = pendingTarget ?? current
@@ -1260,7 +1569,7 @@ window.__ModuleLoader__.load({
             rows.push({
               key,
               provider: group.id,
-              providerName: displayProviderName(group.name),
+              providerName: showProviderIds ? group.id : displayProviderName(group.name),
               model,
               groupIndex,
               modelIndex,
@@ -1270,7 +1579,7 @@ window.__ModuleLoader__.load({
           })
         })
         return rows
-      }, [groups, favoriteKeys, routableKnown, routableSet])
+      }, [groups, favoriteKeys, routableKnown, routableSet, showProviderIds])
 
       const rowByKey = useMemo(() => new Map(allRows.map(row => [row.key, row])), [allRows])
       const currentRow = displaySelection === null
@@ -1281,10 +1590,13 @@ window.__ModuleLoader__.load({
 
       /** The provider list the rail renders, in catalog order. */
       const providers = useMemo(
-        () => groups.map(group => ({ id: group.id, name: displayProviderName(group.name) })),
-        [groups],
+        () => groups.map(group => ({ id: group.id, name: showProviderIds ? group.id : displayProviderName(group.name) })),
+        [groups, showProviderIds],
       )
 
+      const initialPane = allRows.some(row => row.favorite) ? 'favorites'
+        : currentRow?.provider ?? groups[0]?.id ?? 'favorites'
+      const pane = chosenPane ?? initialPane
       const searching = normalize(query).length > 0
 
       /** The rows the results column shows, plus whether they carry provider headings. */
@@ -1340,11 +1652,11 @@ window.__ModuleLoader__.load({
       const provider = current?.provider
       const model = current?.model
       const address = useMemo(() => available && typeof sessionId === 'string' && sessionId.length > 0
-        && typeof provider === 'string' && typeof model === 'string'
+        && originalProvider(provider) && typeof model === 'string'
         ? { sessionId, provider, model }
         : null, [available, sessionId, provider, model])
-      const generation = controlOperations.generation()
-      const entry = controlOperations.route(binding, address)
+      const generation = controlOperations?.generation() ?? connectionEpoch
+      const entry = controlOperations?.route(binding, address) ?? null
       const confirmed = entry?.confirmed
       const canGuard = binding != null && guardedBinding === binding
       const batchEnabled = canGuard && confirmed?.batch === true
@@ -1436,7 +1748,7 @@ window.__ModuleLoader__.load({
         if (cancel) draftRef.current = null
         else saveDraft()
         setOpen(false)
-        setPane('favorites')
+        setPane(null)
         setQuery('')
         setHighlight(0)
         if (restoreFocus === true) queueMicrotask(() => { triggerRef.current?.focus() })
@@ -1444,8 +1756,8 @@ window.__ModuleLoader__.load({
 
       useLayoutEffect(() => {
         closeRef.current = close
-        waitRef.current = () => controlOperations.wait(binding, directory, true)
-      }, [binding, close, controlOperations, directory])
+        waitRef.current = waitForSelection ?? (() => controlOperations?.wait(binding, directory, true))
+      }, [binding, close, controlOperations, directory, waitForSelection])
       useLayoutEffect(() => {
         const unregister = !available || binding == null ? undefined
           : guard.register(binding, () => closeRef.current?.(), () => waitRef.current?.())
@@ -1471,18 +1783,30 @@ window.__ModuleLoader__.load({
         return () => { window.clearInterval(timer) }
       }, [entry, pendingWindowId, running, controlOperations])
 
-      const hasVisibleFavorites = allRows.some(row => row.favorite)
       const show = useCallback(() => {
+        if (!available || locked || !isRendered(rootRef.current)) return false
+        if (openRef.current) {
+          searchRef.current?.focus({ preventScroll: true })
+          return true
+        }
         openRef.current = true
         triggerRef.current?.focus()
-        setPane(hasVisibleFavorites ? 'favorites' : (displaySelection?.provider ?? 'favorites'))
+        setPane(controlOperations === undefined ? null : initialPane)
         setQuery('')
         setHighlight(0)
         setOpen(true)
         reload()
-        routable.load()
         if (entry !== null) controlOperations.load(entry)
-      }, [controlOperations, displaySelection, entry, hasVisibleFavorites, reload, routable])
+        return true
+      }, [available, controlOperations, entry, initialPane, locked, reload])
+
+      useImperativeHandle(openerRef, () => show, [show])
+      const showRef = useRef(show)
+      useLayoutEffect(() => { showRef.current = show }, [show])
+      useLayoutEffect(() => {
+        if (!available || typeof composerId !== 'string') return
+        return registerPickerOpener?.({ sessionId, composerId }, () => showRef.current())
+      }, [available, composerId, registerPickerOpener, sessionId])
 
       /** What the trigger click and the toggle chord both do. */
       const toggle = useCallback(() => {
@@ -1559,22 +1883,31 @@ window.__ModuleLoader__.load({
 
       const chooseModel = useCallback((row) => {
         if (locked) return
-        if (displaySelection?.provider === row.provider && displaySelection.model === row.model.id) {
+        const isCurrent = displaySelection?.provider === row.provider && displaySelection.model === row.model.id
+        if (isCurrent && !draftMode) {
           close(true)
           return
         }
-        if (busy || binding == null || getBinding() !== binding) return
+        if (busy) return
         const defaultEffort = row.model.reasoning?.defaultEffort
+        const selection = isCurrent ? displaySelection : {
+          provider: row.provider,
+          model: row.model.id,
+          ...defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort },
+        }
+        if (applySelection !== undefined) {
+          // A draft can explicitly pin the displayed Host default.
+          applySelection(selection)
+          if (draftMode) close(true)
+          return
+        }
+        if (binding == null || getBinding() !== binding) return
         saveDraft()
         // The active row or slider may disappear or become disabled during selection.
         searchRef.current?.focus({ preventScroll: true })
         lastActionRef.current = 'select'
-        controlOperations.switchModel(binding, directory, {
-          provider: row.provider,
-          model: row.model.id,
-          ...defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort },
-        }, select, () => getBinding() === binding)
-      }, [binding, busy, close, controlOperations, directory, displaySelection, getBinding, locked, saveDraft, select])
+        controlOperations.switchModel(binding, directory, selection, select, () => getBinding() === binding)
+      }, [applySelection, binding, busy, close, controlOperations, directory, displaySelection, draftMode, getBinding, locked, saveDraft, select])
 
       // Focus the search field whenever the card opens, mirroring T3.
       useLayoutEffect(() => {
@@ -1646,6 +1979,12 @@ window.__ModuleLoader__.load({
         if (!available) return undefined
         const handle = {
           enabled: () => locked !== true && isRendered(rootRef.current),
+          hasFocus: () => {
+            const focused = document.activeElement
+            const root = rootRef.current
+            return panelRef.current?.contains(focused) === true || root?.contains(focused) === true ||
+              root?.closest('[data-composer-card], [data-zen-remote="new-conversation"]')?.contains(focused) === true
+          },
           toggle,
         }
         mountedPickers.add(handle)
@@ -1741,7 +2080,7 @@ window.__ModuleLoader__.load({
       const renderModelRow = (row, index) => {
         const isFavorite = row.favorite
         const favoritePending = favoriteState.pending.has(favoriteKey(favoriteAddress(row.provider, row.model.id)))
-        const starDisabled = !favoriteState.writable || favoritePending
+        const starDisabled = !favoriteState.writable || favoritePending || (draftMode && locked)
         const starLabel = t(favoritePending ? 'favorite.saving' : starDisabled ? 'favorite.readOnly'
           : isFavorite ? 'favorite.remove' : 'favorite.add')
         const isSelected = displaySelection !== null
@@ -1792,7 +2131,7 @@ window.__ModuleLoader__.load({
               onMouseDown: (event) => { event.preventDefault(); event.stopPropagation() },
               onClick: (event) => {
                 event.stopPropagation()
-                if (!starDisabled) favorites.toggle(row.provider, row.model.id, !isFavorite)
+                if (!starDisabled) toggleFavorite(row.provider, row.model.id, !isFavorite)
               },
             }, h(StarIcon, { filled: isFavorite, className: 't3mp-star-icon' })),
           ),
@@ -1883,7 +2222,7 @@ window.__ModuleLoader__.load({
           h('span', {}, favoriteState.error === 'unavailable' ? t('error.favoritesUnavailable')
             : t('error.favoritesLoad', { message: controlErrorMessage(favoriteState.error, t) })),
           favoriteState.error === 'unavailable' ? null
-            : h('button', { type: 'button', className: 't3mp-retry', onClick: favorites.refresh }, t('action.retry')),
+            : h('button', { type: 'button', className: 't3mp-retry', onClick: reloadFavorites }, t('action.retry')),
         ))
       }
       for (const failure of state.failures) {
@@ -1898,6 +2237,7 @@ window.__ModuleLoader__.load({
         speed: editedValues.speed,
         contextWindow: editedValues.contextWindow,
       }
+      const keepControls = applySelection !== undefined && pendingTarget?.provider === provider && pendingTarget?.model === model
       const controlRows = Object.entries(options).filter(([, choices]) => choices.length > 0).map(([field, choices]) => {
         const value = sliderValues[field]
         const isListed = choices.some(choice => choice.value === value)
@@ -1907,8 +2247,15 @@ window.__ModuleLoader__.load({
           label: t(`${field}.row`),
           options: isListed ? choices : [{ value, label: effortLabel, selectable: false }, ...choices],
           value,
-          disabled: controlsLocked || entry === null || loadingControls || (field !== 'effort' && !canGuard),
-          edit: value => edit(field === 'effort' ? 'reasoningEffort' : field, value),
+          disabled: controlsLocked || (applySelection === undefined && (entry === null || loadingControls))
+            || (field !== 'effort' && !canGuard),
+          edit: (value) => {
+            if (applySelection !== undefined && field === 'effort') {
+              applySelection({ provider, model, ...(value === null ? {} : { reasoningEffort: value }) })
+            } else {
+              edit(field === 'effort' ? 'reasoningEffort' : field, value)
+            }
+          },
         })
       })
       let controlsFeedback = null
@@ -1954,8 +2301,8 @@ window.__ModuleLoader__.load({
           empty ? h('div', { className: 't3mp-empty' }, t('empty.models')) : null,
           controlsFeedback,
           busy ? null : saveFeedback,
-          busy ? null : controlRows,
-          open && !addressedChild && !listedChild && teamMode !== undefined && setTeamEnabled !== undefined
+          busy && !keepControls ? null : controlRows,
+          open && showTeam && teamMode !== undefined && setTeamEnabled !== undefined
             ? h('label', { className: 't3mp-team-row' },
               t('team.label'),
               h('input', {
@@ -2401,6 +2748,13 @@ window.__ModuleLoader__.load({
 
       const notices = createNoticeStore()
       const favorites = createFavoritesStore(notices.report)
+      const locale = ctx.locale
+      ctx.provide('t3ModelPicker', {
+        DraftPicker: props => h(DraftPickerView, {
+          ...props, key: props.hostId, locale, profileFavorites: favorites, report: notices.report,
+        }),
+      })
+      const connectionEpoch = createPickerStore(0)
       let reconnectFavorites = () => {}
       ctx.inject(['remote', 'remote.settings'], (scope) => {
         scope.effect(() => {
@@ -2423,6 +2777,7 @@ window.__ModuleLoader__.load({
         return ctx.sessions.binding?.(sessionId)
       }
       const guard = createSubmissionGuard(getBinding)
+      const selectionOperations = new WeakMap()
       // The guard can still wait for an in-flight save from this factory during HMR.
       ctx.effect(() => () => { guard.dispose() }, 't3-model-picker: submission guard')
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
@@ -2452,6 +2807,7 @@ window.__ModuleLoader__.load({
 
       const refresh = routable.refresh
       const invalidateControls = () => {
+        connectionEpoch.publish(connectionEpoch.getSnapshot() + 1)
         guard.reset()
         controlOperations.reset()
         notices.dismiss(notices.getSnapshot())
@@ -2503,6 +2859,10 @@ window.__ModuleLoader__.load({
         return () => { window.removeEventListener('keydown', onKeyDown, true) }
       }, 't3-model-picker: toggle chord')
 
+      const registerPickerOpener = (target, open) => ctx.modelDirectories.registerPickerOpener?.(target, open)
+      const SessionPicker = (props) => typeof props.hostId === 'string'
+        ? h(RemoteSessionPicker, props)
+        : h(LocalSessionPicker, props)
       ctx.slots.inject('conversation.input.model', () => ctx.slots.register({
         name: 'conversation.input.model',
         // Lower than the shipped seat's default 0: same cell, different
@@ -2510,16 +2870,23 @@ window.__ModuleLoader__.load({
         priority: -1,
         locale: NS,
         inject: (sessionId) => {
+          const remote = REMOTE_PROVIDER.exec(sessionId)
+          const available = ctx.sessions.subagentAddress(sessionId) === undefined
+          if (sessionId.startsWith('zr~')) {
+            return {
+              hostId: remote?.[1] ?? '', connectionEpoch, report: notices.report, registerPickerOpener,
+              selectionOperations, guard, getBinding: () => getBinding(sessionId),
+              available: available && remote !== null && sessionId.length > remote[0].length,
+            }
+          }
           const directory = ctx.modelDirectories.directoryFor(sessionId)
-          const sessions = ctx.sessions
-          const available = sessions.subagentAddress(sessionId) === undefined
           return {
             available,
             directory: directory.store,
             load: () => {
               if (available) directory.load().catch(() => { /* surfaced on the store */ })
             },
-            select: selection => available
+            select: selection => available && originalProvider(selection.provider)
               ? directory.select(selection)
               : Promise.resolve(undefined),
             favorites,
@@ -2528,9 +2895,10 @@ window.__ModuleLoader__.load({
             controlOperations,
             guard,
             getBinding: () => getBinding(sessionId),
+            registerPickerOpener,
           }
         },
-      }, ModelPicker))
+      }, SessionPicker))
     }
 
     return { inject, apply }

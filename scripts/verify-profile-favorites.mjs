@@ -53,6 +53,7 @@ function openClient(legacy, { storage = new Map(), preserveLegacy = false } = {}
   }
   const ctx = {
     effect(run) { cleanups.push(run()) },
+    provide() {},
     inject(keys, run) { if (keys.includes('remote.settings')) run(ctx) },
     locale: { register() {} },
     on(event, listener) { handlers.set(event, listener) },
