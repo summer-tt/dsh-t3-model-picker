@@ -18,6 +18,9 @@ const sessionB = 'session-B'
 const model = 'codex/gpt-6.2-sol'
 const otherModel = 'codex/gpt-6.2-astra'
 const provider = 'magpie'
+const remoteSession = 'zr~1234abcd~session-remote'
+const remoteProvider = `zr~1234abcd~${provider}`
+const controlsPath = '/dsh-test/_dsh/zen-remote/model-controls'
 const key = (sessionId, modelId = model) => `${sessionId}/${modelId}`
 const calls = []
 const preferences = new Map()
@@ -74,6 +77,17 @@ try {
   const page = await context.newPage()
   page.on('pageerror', error => pageErrors.push(error))
   page.setDefaultTimeout(4000)
+  await page.route(`${origin}/_dsh/zen-remote/client/session-host`, async route => {
+    const { sessionId, operation } = route.request().postDataJSON()
+    assert.equal(sessionId, remoteSession)
+    const reasoning = { defaultEffort: 'medium', efforts: ['low', 'medium', 'high'].map(id => ({ id, name: id })) }
+    assert.ok(['modelCatalog', 'getFavorites'].includes(operation), `Unexpected remote operation ${operation}`)
+    const value = operation === 'modelCatalog' ? {
+      groups: [{ id: provider, name: 'Magpie', models: [{ id: model, name: model, reasoning }, { id: otherModel, name: otherModel }] }],
+      failures: [], routableProviders: [provider], default: { provider, model },
+    } : { favorites: [] }
+    await route.fulfill({ json: { ok: true, value } })
+  })
   await page.route(`${mount}**`, async route => {
     const request = route.request()
     const url = new URL(request.url())
@@ -81,12 +95,12 @@ try {
       await route.fulfill({ contentType: 'text/html', body: `<!doctype html><base href="${mount}"><div id="app" style="position: fixed; bottom: 12px; right: 12px"></div><button id="outside">Outside</button><div id="overlays"></div>` })
       return
     }
-    assert.equal(url.pathname, '/dsh-test/api/magpie-session-controls')
     assert.match(await request.headerValue('cookie'), /owner-test=fixture/)
     assert.equal(await request.headerValue('authorization'), null)
     const method = request.method()
     const data = method === 'GET' ? Object.fromEntries(url.searchParams) : request.postDataJSON()
-    assert.equal(data.provider, provider)
+    assert.equal(url.pathname, data.sessionId === remoteSession ? controlsPath : '/dsh-test/api/magpie-session-controls')
+    assert.equal(data.provider, data.sessionId === remoteSession ? remoteProvider : provider)
     const address = key(data.sessionId, data.model)
     calls.push({ method, ...data })
     if (method === 'GET') {
@@ -137,7 +151,7 @@ try {
     const dir = dirname(require.resolve(`${pkg}/package.json`))
     await page.addScriptTag({ path: join(dir, 'umd', `${umd}.development.js`) })
   }
-  await page.evaluate(({ provider, model, otherModel }) => {
+  await page.evaluate(({ provider, model, otherModel, remoteSession }) => {
     let definition
     let seat
     let overlay
@@ -169,6 +183,7 @@ try {
     const handlers = new Map()
     const directories = new Map()
     const selectCalls = []
+    let remoteProjection = { next: null, lastUsed: null }
     const h = React.createElement
     const reasoning = {
       defaultEffort: 'medium',
@@ -266,6 +281,7 @@ try {
       sends, abandons,
       render(sessionId, running = false, remount = false) {
         if (remount) revision += 1
+        const projection = remoteProjection
         if (overlay) overlayRoot.render(h(overlay.component, {
           ...overlay.options.inject?.(), t,
           renderFactorySlot: (name, props) => h('button', { 'data-notice': name, onClick: props.onDone }, props.text),
@@ -273,13 +289,20 @@ try {
         root.render(h(seat.component, {
           ...seat.options.inject(sessionId), key: `${sessionId}:${revision}`, locked: false, sessionId,
           t: (name, params) => dictionary[name].replace(/\{(\w+)\}/g, (_, param) => params[param]),
-          useProjection: name => name === 'agentTeam' ? { enabled: false } : { lastUsed: null },
+          useProjection: name => name === 'agentTeam' ? { enabled: false }
+             : sessionId === remoteSession ? projection : { lastUsed: null },
           useSession: selector => selector({ running, subagent: null }),
           useSessions: selector => selector({ byId: {} }),
         }))
       },
       update(sessionId, selection) { directories.get(sessionId).update(selection) },
       refresh() { handlers.get('settings/document-updated')() },
+      relayReconnected() { handlers.get('llm/adapters-updated')() },
+      reset() { handlers.get('connection/reset')() },
+      project(selection) {
+        remoteProjection = { next: selection, lastUsed: null }
+        this.render(remoteSession)
+      },
       failSelect(message) { selectError = message },
       selectCalls,
       selects,
@@ -296,7 +319,7 @@ try {
         record.release()
       },
     }
-  }, { provider, model, otherModel })
+  }, { provider, model, otherModel, remoteSession })
   await page.addScriptTag({ path: fileURLToPath(new URL('../client.js', import.meta.url)) })
   await page.evaluate(sessionId => { window.startPicker(); window.fixture.render(sessionId) }, sessionA)
   const trigger = page.locator('.t3mp-trigger')
@@ -734,6 +757,102 @@ try {
       window.fixture.setSelectTimeout(10000)
     })
   }
+
+  const remoteKey = key(remoteSession)
+  const remotePosts = () => posts().filter(call => call.sessionId === remoteSession)
+  const project = (providerId, modelId = model) => page.evaluate(
+    ({ provider, model }) => window.fixture.project({ provider, model }), { provider: providerId, model: modelId },
+  )
+  const expectRemoteSpeed = value => page.waitForFunction(speed =>
+    document.querySelector('[data-t3mp-speed]')?.getAttribute('data-t3mp-speed') === speed, value)
+  await page.evaluate(sessionId => window.fixture.render(sessionId, false, true), remoteSession)
+  await page.waitForFunction(name => document.querySelector('.t3mp-trigger-label')?.textContent === name, model)
+  assert.equal(gets(remoteKey).length, 0, 'a display-only Host default must not request controls')
+  await project('zr~8765dcba~magpie')
+  await page.waitForFunction(() => document.querySelector('.t3mp-trigger-label')?.textContent === 'Select model')
+  await project('zr~1234abcd~')
+  await project('zr~1234abc~magpie')
+  assert.equal(gets(remoteKey).length, 0, 'wrong-Host and malformed provider ids must not request controls')
+
+  getOverride = address => address === remoteKey && gets(remoteKey).length === 1
+    ? { status: 404, json: { ok: false, error: 'Session is not active' } } : undefined
+  await project(remoteProvider)
+  await expectRemoteSpeed('fast')
+  assert.equal(gets(remoteKey).length, 2, 'the closed trigger retries while the remote session is promoted')
+  assert.equal(await panel.count(), 0)
+
+  await reopen()
+  const pendingRemoteSave = deferred()
+  delays.set(`POST ${remoteKey}`, pendingRemoteSave)
+  const remoteRevision = String(revision)
+  await choose(effort, 'Home')
+  await choose(speed, 'End')
+  await choose(windowSize, 'End')
+  const wroteRemote = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === controlsPath)
+  await page.evaluate(sessionId => window.fixture.send(sessionId), remoteSession)
+  await panel.waitFor({ state: 'hidden' })
+  await wroteRemote
+  assert.deepEqual(remotePosts(), [{ method: 'POST', sessionId: remoteSession, provider: remoteProvider, model,
+    changes: { reasoningEffort: 'low', speed: 'ultrafast', contextWindow: 872000 }, expectedRevision: remoteRevision, allowRunning: true }])
+  const turnsBeforeReceipt = await counts()
+  pendingRemoteSave.release()
+  assert.equal((await sendOutcome()).ok, true)
+  assert.equal((await counts())[0], turnsBeforeReceipt[0] + 1)
+  await expectRemoteSpeed('ultrafast')
+  assert.equal(await trigger.locator('[data-t3mp-window]').textContent(), '872K')
+  assert.equal(await trigger.locator('.t3mp-trigger-effort').textContent(), 'low')
+  delays.delete(`POST ${remoteKey}`)
+
+  getOverride = address => address === remoteKey ? { status: 503, json: { ok: false, error: { code: 'remote-offline' } } } : undefined
+  await page.evaluate(() => window.fixture.relayReconnected())
+  await trigger.click()
+  await panel.getByRole('alert').filter({ hasText: 'remote-offline' }).waitFor()
+  await closePicker()
+  preferences.set(remoteKey, { ...preferences.get(remoteKey), speed: 'fast' })
+  revision++
+  getOverride = undefined
+  await page.evaluate(() => window.fixture.relayReconnected())
+  await expectRemoteSpeed('fast')
+
+  denied.set(remoteKey, 'remote fixture rejects the write')
+  await reopen()
+  await choose(speed, 'End')
+  await page.evaluate(sessionId => window.fixture.send(sessionId), remoteSession)
+  assert.equal((await sendOutcome()).ok, false)
+  await notice.filter({ hasText: 'remote fixture rejects the write' }).waitFor()
+  assert.equal(remotePosts().length, 2)
+  assert.equal(remotePosts()[1].expectedRevision, String(revision))
+  denied.delete(remoteKey)
+  await reopen()
+  await panel.getByRole('button', { name: 'Discard unsaved changes' }).click()
+  await choose(speed, 'End')
+  await project('zr~8765dcba~magpie')
+  await panel.waitFor({ state: 'hidden' })
+  assert.equal(remotePosts().length, 2, 'changing the projected Host cancels the open controls draft')
+  await project(remoteProvider)
+
+  for (const error of [{ code: 'remote-unsupported' }, 'Session not found']) {
+    getOverride = () => ({ status: 404, json: { ok: false, error } })
+    await page.evaluate(() => window.fixture.reset())
+    await trigger.click()
+    await effort.waitFor()
+    await page.waitForFunction(() => !document.querySelector('.t3mp-status'))
+    assert.equal(await panel.getByRole('alert').count(), 0)
+    assert.equal(await speed.count(), 0)
+    assert.equal(await windowSize.count(), 0)
+    await closePicker()
+  }
+  getOverride = () => ({ status: 404, json: { ok: false, error: { code: 'session-not-shared' } } })
+  await trigger.click()
+  await panel.getByRole('alert').filter({ hasText: 'session-not-shared' }).waitFor()
+  await closePicker()
+  getOverride = () => ({ status: 200, json: { ok: true, value: {} } })
+  await project(remoteProvider, otherModel)
+  await trigger.click()
+  await page.waitForFunction(() => !document.querySelector('.t3mp-status'))
+  assert.equal(await panel.getByRole('slider').count(), 0, 'an unsupported model exposes no controls')
+  assert.equal(await trigger.locator('[data-t3mp-speed], [data-t3mp-window]').count(), 0)
+  assert.equal(remotePosts().length, 2)
 
   assert.deepEqual(pageErrors, [])
   console.log(`T3 browser regression passed (${calls.length - posts().length} reads, ${posts().length} writes)`)

@@ -728,6 +728,8 @@ window.__ModuleLoader__.load({
     }
 
     const WINDOW_REFRESH_MS = 1000
+    const SESSION_INACTIVE = Symbol('remote session inactive')
+    const INACTIVE_RETRY_MS = [250, 750]
     const WINDOW_REASON_KEYS = new Map([
       ['unavailable', 'warning.windowUnavailable'],
       ['measurement-failed', 'warning.windowMeasurementFailed'],
@@ -791,9 +793,20 @@ window.__ModuleLoader__.load({
       return controlValue(result, field) === target || rejectMatches(result, base, target)
     }
 
+    function remoteControlsAddress(sessionId, provider, model) {
+      const session = REMOTE_PROVIDER.exec(sessionId)
+      const remote = REMOTE_PROVIDER.exec(provider)
+      if (session === null || remote === null || session[1] !== remote[1]) return null
+      const original = provider.slice(remote[0].length)
+      if (!sessionId.slice(session[0].length).trim() || !originalProvider(original) || !original.trim()
+        || typeof model !== 'string' || !model.trim()) return null
+      return { sessionId, provider, model }
+    }
+
     async function requestSessionControls(address, signal, change, base) {
-      // Use the current Host's mount and owner cookie, like Magpie's settings page.
-      const url = new URL('api/magpie-session-controls', document.baseURI)
+      const remote = address.sessionId.startsWith('zr~')
+      const path = remote ? '_dsh/zen-remote/model-controls' : 'api/magpie-session-controls'
+      const url = new URL(path, document.baseURI)
       if (change === undefined) url.search = new URLSearchParams(address).toString()
       const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)])
       const response = await fetch(url, {
@@ -810,12 +823,19 @@ window.__ModuleLoader__.load({
         requestSignal.throwIfAborted()
         return undefined
       })
-      const hostError = payload?.ok === false && typeof payload.error === 'string'
-      // Hosts without the endpoint use the native model directory.
-      if (change === undefined && !hostError && (response.status === 404 || response.status === 405)) return null
+      const hostError = payload?.ok === false && typeof payload.error === 'string' ? payload.error : undefined
+      const gatewayError = remote && payload?.ok === false && typeof payload.error?.code === 'string' ? payload.error : undefined
+      if (change === undefined) {
+        const missingEndpoint = response.status === 404 || response.status === 405
+        if (!remote && missingEndpoint && hostError === undefined) return null
+        if (remote && missingEndpoint && (gatewayError?.code === 'remote-unsupported'
+          || (gatewayError === undefined && hostError === undefined))) return null
+        if (remote && response.status === 404 && hostError === 'Session not found') return null
+        if (remote && response.status === 404 && hostError === 'Session is not active') return SESSION_INACTIVE
+      }
       if (!response.ok || payload?.ok === false) {
-        const error = new Error(hostError && payload.error.length > 0 ? payload.error : `HTTP ${response.status}`)
-        error.rejected = hostError && response.status >= 400 && response.status < 500
+        const error = new Error(hostError || gatewayError?.message || gatewayError?.code || `HTTP ${response.status}`)
+        error.rejected = (hostError !== undefined || gatewayError !== undefined) && response.status >= 400 && response.status < 500
         throw error
       }
       const values = change?.changes ?? (change === undefined ? {} : { [change.field]: change.value })
@@ -883,8 +903,13 @@ window.__ModuleLoader__.load({
       const confirm = (entry, confirmed) => {
         entry.confirmed = confirmed
         const warning = confirmed?.windowWarning
-        if (warning !== undefined && !seenWarnings.has(warning.id)) {
-          seenWarnings.add(warning.id)
+        if (warning === undefined) return
+        const { sessionId } = entry.address
+        const remote = sessionId.startsWith('zr~')
+        if (remote && !entry.isCurrent?.()) return
+        const key = remote ? JSON.stringify([sessionId, warning.id]) : warning.id
+        if (!seenWarnings.has(key)) {
+          seenWarnings.add(key)
           reportWindow(warning)
         }
       }
@@ -911,7 +936,8 @@ window.__ModuleLoader__.load({
       }
 
       // A refresh that started before a save cannot publish over that save's receipt.
-      const load = (entry, mode) => {
+      const load = (entry, mode, retry = 0) => {
+        window.clearTimeout(entry.inactiveRetry)
         if (entry.session.signal.aborted || (mode !== undefined && entry.confirmed?.pendingWindow === undefined)) return
         if (entry.reading || entry.pending.length > 0 || entry.unknown) {
           if (mode !== 'poll') entry.refreshRequested = true
@@ -922,8 +948,13 @@ window.__ModuleLoader__.load({
         entry.reading = tag
         void requestSessionControls(entry.address, entry.session.signal).then((confirmed) => {
           if (entry.session.signal.aborted || entry.reading !== tag || entry.refreshRequested) return
-          confirm(entry, confirmed)
+          confirm(entry, confirmed === SESSION_INACTIVE ? null : confirmed)
           entry.loadError = undefined
+          if (confirmed === SESSION_INACTIVE && retry < INACTIVE_RETRY_MS.length && entry.isCurrent?.()) {
+            entry.inactiveRetry = window.setTimeout(() => {
+              if (entry.isCurrent?.()) load(entry, undefined, retry + 1)
+            }, INACTIVE_RETRY_MS[retry])
+          }
         }, (error) => {
           if (entry.session.signal.aborted || entry.reading !== tag) return
           entry.loadError = error
@@ -943,7 +974,7 @@ window.__ModuleLoader__.load({
         entry.verifying = requestSessionControls(entry.address, signal).then((confirmed) => {
           if (signal.aborted) throw signal.reason
           const uncertain = entry.unknown
-          if (confirmed === null || (uncertain !== 'legacy' && confirmed.batch !== true)) {
+          if (confirmed === null || confirmed === SESSION_INACTIVE || (uncertain !== 'legacy' && confirmed.batch !== true)) {
             throw new Error('invalid-session-controls')
           }
           if (record(uncertain) && confirmsBatch(confirmed, uncertain.verifyBase, uncertain.changes, true)) {
@@ -1004,8 +1035,10 @@ window.__ModuleLoader__.load({
           const remaining = { ...changes }
           let error
           try {
+            if (batch.isCurrent?.() === false) throw new Error('Model selection changed')
             await verify(entry)
             if (signal.aborted) return
+            if (batch.isCurrent?.() === false) throw new Error('Model selection changed')
             if (base?.batch === true) {
               // A known candidate resolution can advance the revision while this draft is open.
               const writeBase = rebaseWindowSettlement(predecessor?.receipt ?? base, entry.confirmed)
@@ -1063,8 +1096,9 @@ window.__ModuleLoader__.load({
             entry.failure = failure
             report('error.controlsSave', error)
             publish()
-            if (!entry.unknown) load(entry)
-            else if (!record(entry.unknown)) {
+            if (!entry.unknown) {
+              if (batch.isCurrent?.() !== false) load(entry)
+            } else if (!record(entry.unknown)) {
               await verify(entry).catch(() => {})
               if (!entry.unknown && confirmsBatch(entry.confirmed, batch.verifyBase, changes)) batch.receipt = entry.confirmed
             }
@@ -1151,12 +1185,12 @@ window.__ModuleLoader__.load({
           listeners.add(listener)
           return () => { listeners.delete(listener) }
         },
-        commit(entry, changes, base, predecessor, select) {
+        commit(entry, changes, base, predecessor, select, isCurrent) {
           const { session } = entry
           if (session.signal.aborted) return
           entry.reading = undefined
           for (const field of Object.keys(changes)) delete entry.failed[field]
-          const batch = { entry, changes, base, predecessor, select }
+          const batch = { entry, changes, base, predecessor, select, isCurrent }
           entry.pending.push(batch)
           session.queue.push(batch)
           if (session.cycle === undefined) {
@@ -1202,11 +1236,11 @@ window.__ModuleLoader__.load({
           session.switch = switching
           publish()
         },
-        wait(binding, directory, remind = false) {
+        wait(binding, selection, remind = false) {
           if (binding == null) return
           const session = sessionFor(binding)
           if (session.switch) return session.switch.promise
-          return waitForControls(session, directory.getSnapshot().current, remind)
+          return waitForControls(session, selection, remind)
         },
         reset() {
           controller.abort(new Error('Session connection changed'))
@@ -1407,9 +1441,10 @@ window.__ModuleLoader__.load({
 
     function RemoteSessionPicker({
       sessionId, hostId, locked, connectionEpoch, available, useProjection, useSession, report,
-      guard, getBinding, selectionOperations, ...props
+      guard, getBinding, selectionOperations, controlOperations, routable, ...props
     }) {
       const epoch = useSnapshot(connectionEpoch)
+      const { controlsRevision } = useSnapshot(routable)
       const backend = useMemo(() => createSessionHost(sessionId, report), [epoch, report, sessionId])
       const projection = useProjection('modelSelection')
       const running = useSession(snapshot => snapshot.running === true)
@@ -1429,26 +1464,55 @@ window.__ModuleLoader__.load({
           disconnect()
         }
       }, [available, backend])
+      useEffect(() => {
+        if (backend.catalog.getSnapshot().error !== null) backend.load()
+      }, [backend, controlsRevision])
       const seenProjection = useRef(projection)
       useLayoutEffect(() => {
         seenProjection.current = projection
         setReceipt(null)
       }, [projection])
-      const current = receipt?.selection ?? projectedSelection(projection, hostId, catalog?.default)
+      const boundSelection = (receipt?.binding === binding && receipt?.backend === backend
+        && seenProjection.current === projection ? receipt?.selection : undefined)
+        ?? projectedSelection(projection, hostId, undefined)
+      const current = boundSelection ?? projectedSelection(projection, hostId, catalog?.default)
       const state = useMemo(() => hostDirectoryState(catalog, current, error), [catalog, current, error])
-      const availability = useMemo(() => hostAvailability(catalog), [catalog])
-      const applySelection = useCallback((selection) => {
+      const availability = useMemo(() => ({ ...hostAvailability(catalog), controlsRevision }), [catalog, controlsRevision])
+      const provider = boundSelection?.provider
+      const model = boundSelection?.model
+      const address = useMemo(() => available && binding?.sessionId === sessionId && provider !== undefined
+        ? remoteControlsAddress(binding.sessionId, `zr~${hostId}~${provider}`, model)
+        : null, [available, binding, hostId, model, provider, sessionId])
+      const currentAddress = useRef(address)
+      useLayoutEffect(() => {
+        currentAddress.current = address
+        return () => { currentAddress.current = null }
+      }, [address])
+      const isAddressCurrent = useCallback(candidate => getBinding() === binding
+        && currentAddress.current?.sessionId === candidate?.sessionId
+        && currentAddress.current?.provider === candidate?.provider && currentAddress.current?.model === candidate?.model,
+      [binding, getBinding])
+      const remoteControls = useMemo(() => ({ address, isAddressCurrent }), [address, isAddressCurrent])
+      const applySelection = useCallback((selection, waitForControls, isCurrent) => {
         const token = lifetime.current
         if (locked || !available || token == null || binding == null || getBinding() !== binding
           || selectionOperations.has(binding)) return
         setPending(selection)
-        const operation = backend.select(selection).then((selected) => {
-          if (lifetime.current !== token) return
-          if (seenProjection.current === projection) setReceipt({ selection: selected })
-        }).catch((error) => {
-          if (lifetime.current === token) report('error.action', error)
-          throw error
-        }).finally(() => {
+        const operation = (async () => {
+          if (waitForControls !== undefined) await waitForControls
+          try {
+            if (lifetime.current !== token || getBinding() !== binding || isCurrent() === false) {
+              throw new Error('Model selection changed')
+            }
+            const selected = await backend.select(selection)
+            if (lifetime.current === token && getBinding() === binding && seenProjection.current === projection) {
+              setReceipt({ binding, backend, selection: selected })
+            }
+          } catch (error) {
+            if (lifetime.current === token && getBinding() === binding) report('error.action', error)
+            throw error
+          }
+        })().finally(() => {
           selectionOperations.delete(binding)
           if (lifetime.current === token) setPending(undefined)
         })
@@ -1462,8 +1526,8 @@ window.__ModuleLoader__.load({
       }, [backend])
       return h(ModelPicker, {
         ...props, sessionId, locked, available, running, state, catalog: availability, pendingTarget, applySelection,
-         showProviderIds: true,
-        load, favorites: backend.favorites, guard, getBinding, waitForSelection, generation: epoch,
+        showProviderIds: true, controlOperations, remoteControls,
+        load, favorites: backend.favorites, guard, getBinding, waitForSelection,
       })
     }
 
@@ -1515,7 +1579,7 @@ window.__ModuleLoader__.load({
       locked, available, directory = EMPTY_DIRECTORY, state, catalog, load, select, favorites = EMPTY_FAVORITES_STORE,
       favoriteState: controlledFavorites, toggleFavorite = favorites.toggle, reloadFavorites = favorites.refresh,
       setTeamEnabled, teamMode, modelSelection, showTeam, running = false,
-      controlOperations, guard, getBinding = NO_BINDING, generation: connectionEpoch, waitForSelection,
+      controlOperations, guard, getBinding = NO_BINDING, remoteControls, waitForSelection,
       pendingTarget: selectionTarget, applySelection,
       sessionId, composerId, registerPickerOpener, openerRef, draftMode = false, showProviderIds = false, t,
     }) {
@@ -1651,13 +1715,26 @@ window.__ModuleLoader__.load({
       const controlsBusy = busy || state.pending != null || state.status === 'selecting'
       const provider = current?.provider
       const model = current?.model
-      const address = useMemo(() => available && typeof sessionId === 'string' && sessionId.length > 0
+      const localAddress = useMemo(() => remoteControls === undefined && available
+        && typeof sessionId === 'string' && sessionId.length > 0 && !sessionId.startsWith('zr~')
         && originalProvider(provider) && typeof model === 'string'
         ? { sessionId, provider, model }
-        : null, [available, sessionId, provider, model])
-      const generation = controlOperations?.generation() ?? connectionEpoch
+        : null, [remoteControls, available, sessionId, provider, model])
+      const address = remoteControls === undefined ? localAddress : remoteControls.address
+      const generation = controlOperations?.generation()
       const entry = controlOperations?.route(binding, address) ?? null
       const confirmed = entry?.confirmed
+      useLayoutEffect(() => {
+        if (entry === null || remoteControls === undefined) return
+        const isCurrent = () => remoteControls.isAddressCurrent(entry.address)
+        entry.isCurrent = isCurrent
+        return () => {
+          if (entry.isCurrent === isCurrent) {
+            entry.isCurrent = undefined
+            window.clearTimeout(entry.inactiveRetry)
+          }
+        }
+      }, [entry, remoteControls])
       const canGuard = binding != null && guardedBinding === binding
       const batchEnabled = canGuard && confirmed?.batch === true
       const pending = entry?.pending ?? []
@@ -1674,8 +1751,10 @@ window.__ModuleLoader__.load({
       const editedValues = { ...values, ...draft?.changes }
       const menuControls = draft === null ? confirmed : draft.base
       const menuBatch = canGuard && menuControls?.batch === true
-      const controlsLocked = locked || controlsBusy || teamPending || (running && !(menuBatch
-        && confirmed?.runningEdits === true && menuControls.runningEdits === true))
+      const nativeRemoteEffort = remoteControls !== undefined && menuControls?.batch !== true
+      const remoteControlsLocked = remoteControls !== undefined && (!canGuard || entry?.loadError !== undefined)
+      const controlsLocked = locked || controlsBusy || teamPending
+        || (running && !(menuBatch && confirmed?.runningEdits === true && menuControls.runningEdits === true))
       const { efforts, speed, contextWindow } = menuControls ?? {}
       const loadingControls = entry !== null && confirmed === undefined && entry.loadError === undefined
       const options = useMemo(() => {
@@ -1735,12 +1814,13 @@ window.__ModuleLoader__.load({
       const saveDraft = useCallback(() => {
         const draft = draftRef.current
         draftRef.current = null
-        const latest = directory.getSnapshot().current
-        if (draft !== null && draft.entry === entry && Object.keys(draft.changes).length > 0
-          && getBinding() === binding && latest?.provider === entry.address.provider && latest?.model === entry.address.model) {
-          controlOperations.commit(entry, draft.changes, draft.base, draft.predecessor, select)
+        if (draft === null || draft.entry !== entry || Object.keys(draft.changes).length === 0 || getBinding() !== binding) return
+        const isCurrent = remoteControls === undefined ? undefined : () => remoteControls.isAddressCurrent(entry.address)
+        const latest = isCurrent === undefined ? directory.getSnapshot().current : null
+        if (isCurrent ? isCurrent() : latest?.provider === entry.address.provider && latest?.model === entry.address.model) {
+          controlOperations.commit(entry, draft.changes, draft.base, draft.predecessor, select, isCurrent)
         }
-      }, [binding, controlOperations, directory, entry, getBinding, select])
+      }, [binding, controlOperations, directory, entry, getBinding, remoteControls, select])
 
       const close = useCallback((restoreFocus, cancel = false) => {
         if (!openRef.current) return
@@ -1756,8 +1836,9 @@ window.__ModuleLoader__.load({
 
       useLayoutEffect(() => {
         closeRef.current = close
-        waitRef.current = waitForSelection ?? (() => controlOperations?.wait(binding, directory, true))
-      }, [binding, close, controlOperations, directory, waitForSelection])
+        waitRef.current = () => waitForSelection?.() ?? controlOperations?.wait(binding,
+          remoteControls === undefined ? directory.getSnapshot().current : address, true)
+      }, [address, binding, close, controlOperations, directory, remoteControls, waitForSelection])
       useLayoutEffect(() => {
         const unregister = !available || binding == null ? undefined
           : guard.register(binding, () => closeRef.current?.(), () => waitRef.current?.())
@@ -1815,7 +1896,7 @@ window.__ModuleLoader__.load({
       }, [close, show])
 
       const edit = (field, value, restoring = false) => {
-        if (!openRef.current || entry === null || controlsLocked || loadingControls) return
+        if (!openRef.current || entry === null || controlsLocked || loadingControls || remoteControlsLocked) return
         const baseline = batchEnabled ? values : { ...values, reasoningEffort: effectiveEffort ?? null }
         const editing = draftRef.current ?? {
           entry, values: baseline, base: canGuard ? confirmed : null, predecessor: pending.at(-1), changes: {}, restored: new Set(),
@@ -1881,6 +1962,11 @@ window.__ModuleLoader__.load({
         if (!teamPending) setDisableRequest(null)
       }
 
+      const applyRemoteSelection = useCallback((selection) => {
+        saveDraft()
+        applySelection(selection, controlOperations.wait(binding, address, true), () => remoteControls.isAddressCurrent(address))
+      }, [address, applySelection, binding, controlOperations, remoteControls, saveDraft])
+
       const chooseModel = useCallback((row) => {
         if (locked) return
         const isCurrent = displaySelection?.provider === row.provider && displaySelection.model === row.model.id
@@ -1896,9 +1982,11 @@ window.__ModuleLoader__.load({
           ...defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort },
         }
         if (applySelection !== undefined) {
-          // A draft can explicitly pin the displayed Host default.
-          applySelection(selection)
-          if (draftMode) close(true)
+          if (draftMode) {
+            // A draft can explicitly pin the displayed Host default.
+            applySelection(selection)
+            close(true)
+          } else applyRemoteSelection(selection)
           return
         }
         if (binding == null || getBinding() !== binding) return
@@ -1907,7 +1995,7 @@ window.__ModuleLoader__.load({
         searchRef.current?.focus({ preventScroll: true })
         lastActionRef.current = 'select'
         controlOperations.switchModel(binding, directory, selection, select, () => getBinding() === binding)
-      }, [applySelection, binding, busy, close, controlOperations, directory, displaySelection, draftMode, getBinding, locked, saveDraft, select])
+      }, [applyRemoteSelection, applySelection, binding, busy, close, controlOperations, directory, displaySelection, draftMode, getBinding, locked, saveDraft, select])
 
       // Focus the search field whenever the card opens, mirroring T3.
       useLayoutEffect(() => {
@@ -2237,8 +2325,9 @@ window.__ModuleLoader__.load({
         speed: editedValues.speed,
         contextWindow: editedValues.contextWindow,
       }
-      const keepControls = applySelection !== undefined && pendingTarget?.provider === provider && pendingTarget?.model === model
+      const keepControls = nativeRemoteEffort && pendingTarget?.provider === provider && pendingTarget?.model === model
       const controlRows = Object.entries(options).filter(([, choices]) => choices.length > 0).map(([field, choices]) => {
+        const useNativeEffort = field === 'effort' && (draftMode || nativeRemoteEffort)
         const value = sliderValues[field]
         const isListed = choices.some(choice => choice.value === value)
         return h(DiscreteSlider, {
@@ -2247,14 +2336,16 @@ window.__ModuleLoader__.load({
           label: t(`${field}.row`),
           options: isListed ? choices : [{ value, label: effortLabel, selectable: false }, ...choices],
           value,
-          disabled: controlsLocked || (applySelection === undefined && (entry === null || loadingControls))
+          disabled: controlsLocked || (!useNativeEffort && (entry === null || loadingControls || remoteControlsLocked))
             || (field !== 'effort' && !canGuard),
           edit: (value) => {
-            if (applySelection !== undefined && field === 'effort') {
-              applySelection({ provider, model, ...(value === null ? {} : { reasoningEffort: value }) })
-            } else {
+            if (!useNativeEffort) {
               edit(field === 'effort' ? 'reasoningEffort' : field, value)
+              return
             }
+            const selection = { provider, model, ...(value === null ? {} : { reasoningEffort: value }) }
+            if (draftMode) applySelection(selection)
+            else applyRemoteSelection(selection)
           },
         })
       })
@@ -2875,7 +2966,7 @@ window.__ModuleLoader__.load({
           if (sessionId.startsWith('zr~')) {
             return {
               hostId: remote?.[1] ?? '', connectionEpoch, report: notices.report, registerPickerOpener,
-              selectionOperations, guard, getBinding: () => getBinding(sessionId),
+              controlOperations, routable, selectionOperations, guard, getBinding: () => getBinding(sessionId),
               available: available && remote !== null && sessionId.length > remote[0].length,
             }
           }
