@@ -727,6 +727,10 @@ window.__ModuleLoader__.load({
       return record(control) && validOptions(control.options, validate) && control.options.includes(control.value)
     }
 
+    function draftControlValue(control, selected) {
+      return control?.options.includes(selected) ? selected : control?.value
+    }
+
     const WINDOW_REFRESH_MS = 1000
     const SESSION_INACTIVE = Symbol('remote session inactive')
     const INACTIVE_RETRY_MS = [250, 750]
@@ -1533,6 +1537,7 @@ window.__ModuleLoader__.load({
 
     function DraftPickerView({
       hostId, catalog, catalogError = null, selection, onSelect, openerRef, disabled = false,
+      modelControls, modelControlSelection, onSelectModelControl,
       favorites, setFavorite, favoritesError = null, onReload = NOOP, onReloadFavorites = NOOP,
       locale, profileFavorites, report,
     }) {
@@ -1571,6 +1576,7 @@ window.__ModuleLoader__.load({
         load: onReload, favoriteState, toggleFavorite: toggle,
         reloadFavorites: profile === undefined ? onReloadFavorites : profileFavorites.refresh,
         applySelection: onSelect, openerRef, draftMode: true, showProviderIds: true, t: locale.bind(NS),
+        modelControls, modelControlSelection, onSelectModelControl,
       })
     }
 
@@ -1581,6 +1587,7 @@ window.__ModuleLoader__.load({
       setTeamEnabled, teamMode, modelSelection, showTeam, running = false,
       controlOperations, guard, getBinding = NO_BINDING, remoteControls, waitForSelection,
       pendingTarget: selectionTarget, applySelection,
+      modelControls, modelControlSelection, onSelectModelControl,
       sessionId, composerId, registerPickerOpener, openerRef, draftMode = false, showProviderIds = false, t,
     }) {
       const storedFavorites = useSnapshot(favorites)
@@ -1715,11 +1722,11 @@ window.__ModuleLoader__.load({
       const controlsBusy = busy || state.pending != null || state.status === 'selecting'
       const provider = current?.provider
       const model = current?.model
-      const localAddress = useMemo(() => remoteControls === undefined && available
+      const localAddress = useMemo(() => !draftMode && remoteControls === undefined && available
         && typeof sessionId === 'string' && sessionId.length > 0 && !sessionId.startsWith('zr~')
         && originalProvider(provider) && typeof model === 'string'
         ? { sessionId, provider, model }
-        : null, [remoteControls, available, sessionId, provider, model])
+        : null, [draftMode, remoteControls, available, sessionId, provider, model])
       const address = remoteControls === undefined ? localAddress : remoteControls.address
       const generation = controlOperations?.generation()
       const entry = controlOperations?.route(binding, address) ?? null
@@ -1740,16 +1747,23 @@ window.__ModuleLoader__.load({
       const pending = entry?.pending ?? []
       const pendingChanges = Object.assign({}, ...pending.map(batch => batch.changes))
       const pendingWindowId = confirmed?.pendingWindow?.id
+      const draftControls = draftMode && current !== null && record(modelControls) ? modelControls : undefined
+      const draftSpeed = validControl(draftControls?.speed, speed => SPEEDS.has(speed)) ? draftControls.speed : undefined
+      const draftWindow = validControl(draftControls?.contextWindow, validTokens) ? draftControls.contextWindow : undefined
       const values = {
         reasoningEffort: batchEnabled ? confirmed.reasoningEffort : current?.reasoningEffort ?? null,
-        speed: confirmed?.speed?.value,
-        contextWindow: confirmed?.pendingWindow?.target ?? confirmed?.contextWindow?.value,
+        speed: draftMode ? draftControlValue(draftSpeed, modelControlSelection?.speed) : confirmed?.speed?.value,
+        contextWindow: draftMode ? draftControlValue(draftWindow, modelControlSelection?.contextWindow)
+          : confirmed?.pendingWindow?.target ?? confirmed?.contextWindow?.value,
         ...pendingChanges,
       }
       const effectiveWindow = confirmed?.runningEdits === true ? confirmed.contextWindow?.value : values.contextWindow
       const draft = draftRef.current?.entry === entry ? draftRef.current : null
       const editedValues = { ...values, ...draft?.changes }
-      const menuControls = draft === null ? confirmed : draft.base
+      const menuControls = draftMode ? {
+        speed: draftSpeed, contextWindow: draftWindow,
+        efforts: validOptions(draftControls?.efforts, validEffort) ? draftControls.efforts : undefined,
+      } : draft === null ? confirmed : draft.base
       const menuBatch = canGuard && menuControls?.batch === true
       const nativeRemoteEffort = remoteControls !== undefined && menuControls?.batch !== true
       const remoteControlsLocked = remoteControls !== undefined && (!canGuard || entry?.loadError !== undefined)
@@ -1764,7 +1778,8 @@ window.__ModuleLoader__.load({
         // Legacy selection keeps its original effective default and list ordering.
         if (reasoning !== undefined && menuBatch) {
           effortOptions.push({ value: null, label: t('effort.providerDefault') })
-        } else if (reasoning !== undefined && reasoning.defaultEffort === undefined && efforts === undefined) {
+        } else if (reasoning !== undefined && reasoning.defaultEffort === undefined
+          && (efforts === undefined || (draftMode && effortOptions.length > 0))) {
           effortOptions.unshift({ value: null, label: t('effort.providerDefault') })
         }
         return {
@@ -1776,10 +1791,10 @@ window.__ModuleLoader__.load({
             ariaLabel: t('contextWindow.tokens', { count: value }),
           })) ?? [],
         }
-      }, [reasoning, efforts, menuBatch, speed, contextWindow, t])
+      }, [reasoning, efforts, menuBatch, draftMode, speed, contextWindow, t])
       const effectiveEffort = values.reasoningEffort ?? reasoning?.defaultEffort
-      const effortLabel = reasoning === undefined ? undefined : effectiveEffort === undefined
-        ? t('effort.providerDefault')
+      const effortLabel = reasoning === undefined || (draftMode && efforts !== undefined && options.effort.length === 0) ? undefined
+        : effectiveEffort === undefined ? t('effort.providerDefault')
         : reasoning.efforts.find(level => level.id === effectiveEffort)?.name ?? effectiveEffort
       const windowLabel = busy || effectiveWindow === undefined ? undefined
         : t('contextWindow.tokens', { count: effectiveWindow })
@@ -2328,6 +2343,7 @@ window.__ModuleLoader__.load({
       const keepControls = nativeRemoteEffort && pendingTarget?.provider === provider && pendingTarget?.model === model
       const controlRows = Object.entries(options).filter(([, choices]) => choices.length > 0).map(([field, choices]) => {
         const useNativeEffort = field === 'effort' && (draftMode || nativeRemoteEffort)
+        const requiresBoundControls = !draftMode && !useNativeEffort
         const value = sliderValues[field]
         const isListed = choices.some(choice => choice.value === value)
         return h(DiscreteSlider, {
@@ -2336,16 +2352,19 @@ window.__ModuleLoader__.load({
           label: t(`${field}.row`),
           options: isListed ? choices : [{ value, label: effortLabel, selectable: false }, ...choices],
           value,
-          disabled: controlsLocked || (!useNativeEffort && (entry === null || loadingControls || remoteControlsLocked))
-            || (field !== 'effort' && !canGuard),
+          disabled: controlsLocked
+            || (requiresBoundControls && (entry === null || loadingControls || remoteControlsLocked))
+            || (field !== 'effort' && (draftMode ? onSelectModelControl === undefined : !canGuard)),
           edit: (value) => {
-            if (!useNativeEffort) {
+            if (useNativeEffort) {
+              const selection = { provider, model, ...(value === null ? {} : { reasoningEffort: value }) }
+              if (draftMode) applySelection(selection)
+              else applyRemoteSelection(selection)
+            } else if (draftMode) {
+              onSelectModelControl?.(field, value)
+            } else {
               edit(field === 'effort' ? 'reasoningEffort' : field, value)
-              return
             }
-            const selection = { provider, model, ...(value === null ? {} : { reasoningEffort: value }) }
-            if (draftMode) applySelection(selection)
-            else applyRemoteSelection(selection)
           },
         })
       })

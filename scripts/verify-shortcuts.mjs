@@ -89,7 +89,7 @@ const GROUPS = [
 const CURRENT = { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'medium' }
 
 /** Boot a page, load the real client half, and hand back what a check needs. */
-async function boot({ platform, handleHostRequest }) {
+async function boot({ platform, handleHostRequest, handleControlsRequest }) {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {
     url: 'http://localhost/',
     pretendToBeVisual: true,
@@ -140,7 +140,7 @@ async function boot({ platform, handleHostRequest }) {
       hostRequests.push(body)
       return handleHostRequest(body, request.signal)
     }
-    return new Response('Not found', { status: 404 })
+    return handleControlsRequest?.(url, request) ?? new Response('Not found', { status: 404 })
   }
   const bindings = new Map()
   const ctx = {
@@ -290,9 +290,35 @@ async function boot({ platform, handleHostRequest }) {
 const MAC = { metaKey: true, shiftKey: true, code: 'KeyM', key: 'M' }
 const OTHER = { ctrlKey: true, shiftKey: true, code: 'KeyM', key: 'M' }
 
+function changeSlider(app, input, index) {
+  return app.act(async () => {
+    Object.getOwnPropertyDescriptor(app.window.HTMLInputElement.prototype, 'value').set.call(input, String(index))
+    input.dispatchEvent(new app.window.Event('input', { bubbles: true }))
+  })
+}
+
 async function main() {
   console.log('\nmacOS, Cmd+Shift:')
-  const mac = await boot({ platform: 'MacIntel' })
+  let boundControls
+  const boundChanges = []
+  const mac = await boot({
+    platform: 'MacIntel',
+    handleControlsRequest(url, request) {
+      if (url.pathname !== '/api/magpie-session-controls' || boundControls === undefined) return
+      if (request.method === 'POST') {
+        const change = JSON.parse(request.body)
+        boundChanges.push(change)
+        boundControls = {
+          ...boundControls,
+          revision: '2',
+          reasoningEffort: change.changes.reasoningEffort,
+          speed: { ...boundControls.speed, value: change.changes.speed },
+          contextWindow: { ...boundControls.contextWindow, value: change.changes.contextWindow },
+        }
+      }
+      return Response.json({ ok: true, value: boundControls })
+    },
+  })
   await mac.render(1)
 
   check('the card starts closed', mac.panels() === 0)
@@ -475,6 +501,37 @@ async function main() {
   await mac.render(1, { directory, useSessions: selector => selector({ byId: { 'session-1': { origin: 'subagent' } } }) })
   check('listed subagents do not expose the Team switch', teamSwitch() === null)
 
+  boundControls = {
+    batch: true, revision: '1', reasoningEffort: 'medium', efforts: ['low', 'medium', 'high'],
+    speed: { options: ['standard', 'fast', 'ultrafast'], value: 'fast' },
+    contextWindow: { options: [272000, 500000], value: 500000 },
+  }
+  await mac.render(1, { sessionId: 'session-with-controls' })
+  await mac.press(MAC)
+  const boundSlider = field => mac.window.document.querySelector(`[data-t3mp-control="${field}"]`)
+  const boundInput = (field, index) => changeSlider(mac, boundSlider(field), index)
+  check('a bound picker displays confirmed speed and context window',
+    boundSlider('speed')?.getAttribute('aria-valuetext') === 'Fast'
+    && boundSlider('contextWindow')?.getAttribute('aria-valuetext') === '500000 tokens')
+  await boundInput('speed', 2)
+  await mac.press({ key: 'Escape' }, boundSlider('speed'))
+  await mac.press(MAC)
+  check('Escape still discards bound edits', boundChanges.length === 0
+    && boundSlider('speed')?.getAttribute('aria-valuetext') === 'Fast')
+  await boundInput('speed', 2)
+  await boundInput('contextWindow', 0)
+  await boundInput('effort', 0)
+  check('bound edits stay local while the card is open', boundChanges.length === 0)
+  await mac.press(MAC)
+  const [saved] = boundChanges
+  check('closing still saves one revisioned batch for the exact bound session', boundChanges.length === 1
+    && saved?.sessionId === 'session-with-controls' && saved.provider === CURRENT.provider && saved.model === CURRENT.model
+    && saved.expectedRevision === '1' && saved.changes.reasoningEffort === 'low'
+    && saved.changes.speed === 'ultrafast' && saved.changes.contextWindow === 272000)
+  check('bound trigger updates after confirmation',
+    mac.triggers()[0].querySelector('[data-t3mp-speed="ultrafast"]') !== null
+    && mac.triggers()[0].querySelector('[data-t3mp-window="272000"]') !== null)
+
   await mac.unmount()
   await mac.press(MAC)
   check('an unmounted seat releases the chord', mac.panels() === 0, `panels=${mac.panels()}`)
@@ -640,7 +697,74 @@ async function checkHostScopedPickers() {
     await app.act(async () => { openerRef.current() })
     await app.click(row('DeepSeek Reasoner'))
     check('reselecting the draft model preserves its edited reasoning effort', choices.at(-1)?.reasoningEffort === 'high')
+
+    const slider = field => query(`[data-t3mp-control="${field}"]`)
+    const sliderValue = field => slider(field)?.getAttribute('aria-valuetext')
+    const controlEdits = []
+    const beforeControls = [app.apiCalls.length, app.directoryCalls.length, app.sends.length]
+    const withControls = {
+      ...draft,
+      modelControls: {
+        speed: { options: ['standard', 'fast', 'ultrafast'], value: 'fast' },
+        contextWindow: { options: [272000, 500000], value: 500000 },
+        efforts: ['low', 'medium'],
+      },
+      onSelectModelControl: (...args) => controlEdits.push(args),
+    }
+    const setSlider = (field, index) => changeSlider(app, slider(field), index)
     await app.act(async () => { openerRef.current() })
+    check('older Zen still shows draft effort without speed or context window',
+      sliderValue('effort') === 'High' && slider('speed') === null && slider('contextWindow') === null)
+    await app.renderDraft(withControls)
+    check('the draft default uses the shared slider rows and trigger indicators',
+      sliderValue('effort') === 'Medium' && slider('effort')?.max === '1'
+      && sliderValue('speed') === 'Fast' && sliderValue('contextWindow') === '500000 tokens'
+      && query('[data-t3mp-speed="fast"]') !== null && query('[data-t3mp-window="500000"]')?.textContent === '500K')
+    await setSlider('speed', 2)
+    await setSlider('contextWindow', 0)
+    await setSlider('effort', 0)
+    check('draft controls send typed intents immediately and keep the card open', app.panels() === 1
+      && JSON.stringify(controlEdits) === JSON.stringify([['speed', 'ultrafast'], ['contextWindow', 272000]])
+      && choices.at(-1)?.reasoningEffort === 'low' && choices.at(-1)?.model === first.model)
+    await app.renderDraft({ ...withControls, selection: choices.at(-1),
+      modelControlSelection: { speed: 'ultrafast', contextWindow: 272000 } })
+    check('controlled values refresh the shared sliders and accessible trigger',
+      sliderValue('speed') === 'Ultrafast' && sliderValue('contextWindow') === '272000 tokens'
+      && sliderValue('effort') === 'Low' && /Context window 272000 tokens · Speed Ultrafast/.test(app.triggers()[0].getAttribute('aria-label')))
+    await app.press({ key: 'Escape', code: 'Escape' }, slider('contextWindow'))
+    await app.act(async () => { openerRef.current() })
+    check('Escape closes the draft card and reopening preserves parent-staged controls',
+      app.panels() === 1 && sliderValue('speed') === 'Ultrafast' && sliderValue('contextWindow') === '272000 tokens'
+      && controlEdits.length === 2)
+    await app.renderDraft({ ...withControls, modelControlSelection: { speed: 'retired', contextWindow: 999 },
+      onSelectModelControl: undefined })
+    check('invalid staged values fall back to the advertised defaults and optional callbacks make rows read-only',
+      sliderValue('speed') === 'Fast' && sliderValue('contextWindow') === '500000 tokens'
+      && slider('speed')?.getAttribute('aria-disabled') === 'true'
+      && slider('contextWindow')?.getAttribute('aria-disabled') === 'true')
+    await setSlider('speed', 2)
+    const noDefault = {
+      ...catalog,
+      groups: remoteGroups.map(group => ({ ...group, models: group.models.map(model => model.id === first.model
+        ? { ...model, reasoning: { efforts: model.reasoning.efforts } } : model) })),
+    }
+    await app.renderDraft({ ...withControls, catalog: noDefault, selection: { ...first, reasoningEffort: 'low' } })
+    await setSlider('effort', 0)
+    check('draft effort can return to the provider default with a Host allowlist',
+      choices.at(-1)?.model === first.model && !Object.hasOwn(choices.at(-1), 'reasoningEffort'))
+    await app.renderDraft({ ...draft, modelControls: { efforts: [] } })
+    check('an empty draft effort allowlist hides both the row and the trigger effort',
+      slider('effort') === null && query('.t3mp-trigger-effort') === null)
+    await app.click(row('DeepSeek Chat'))
+    await app.renderDraft({ ...draft, selection: choices.at(-1), modelControls: { efforts: [] },
+      modelControlSelection: { speed: 'ultrafast', contextWindow: 272000 } })
+    await app.act(async () => { openerRef.current() })
+    check('the unsupported draft model has no slider rows or trigger indicators',
+      trigger() === 'DeepSeek Chat' && query('[data-t3mp-control]') === null
+      && query('[data-t3mp-speed], [data-t3mp-window], .t3mp-trigger-effort') === null)
+    check('draft edits and model changes make no bound API, directory, or prompt calls',
+      controlEdits.length === 2 && [app.apiCalls.length, app.directoryCalls.length, app.sends.length]
+        .every((count, index) => count === beforeControls[index]))
     await app.renderDraft({ ...draft, hostId: '8765dcba', catalog: null })
     check('changing Host discards the previously open draft card', app.panels() === 0 && trigger() === 'Loading models…')
     await app.unmount()
